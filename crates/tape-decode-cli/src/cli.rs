@@ -13,7 +13,7 @@ use crate::decode::{decode_all, decode_all_mt, MtParams};
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
 use crate::metadata::{PcmAudioParameters, TbcMetadataFull, VideoParameters};
 use crate::os;
-use crate::profiles::{flatten_profile, load_profile, load_profile_file};
+use crate::profiles::{flatten_profile, load_profile, load_profile_file, profile_names};
 use crate::reader::{open_source, DecodeReader, SampleFormat};
 use crate::writer::DecodeWriter;
 use tape_decode::{
@@ -105,6 +105,8 @@ enum Command {
     Decode(DecodeArgs),
     /// Flatten a named profile and write it to a JSON file.
     WriteProfile(WriteProfileArgs),
+    /// List the names of all embedded profiles.
+    ListProfiles(ListProfilesArgs),
     /// Compare two decode outputs.
     Compare(CompareArgs),
 }
@@ -301,6 +303,9 @@ struct WriteProfileArgs {
 }
 
 #[derive(Args, Debug)]
+struct ListProfilesArgs {}
+
+#[derive(Args, Debug)]
 struct CompareArgs {
     /// Reference and candidate metadata sidecars (`.tbc.json`).
     #[arg(long, num_args = 2, value_names = ["REFERENCE", "CANDIDATE"])]
@@ -346,6 +351,7 @@ pub fn run_cli() -> Result<()> {
     match Cli::parse().command {
         Command::Decode(args) => run_decode(args),
         Command::WriteProfile(args) => run_write_profile(args),
+        Command::ListProfiles(args) => run_list_profiles(args),
         Command::Compare(args) => run_compare(args),
     }
 }
@@ -512,6 +518,13 @@ fn run_write_profile(args: WriteProfileArgs) -> Result<()> {
         .with_context(|| format!("failed to open profile output file {}", args.out.display()))?;
     serde_json::to_writer(file, &profile)
         .with_context(|| format!("failed to write profile to {}", args.out.display()))?;
+    Ok(())
+}
+
+fn run_list_profiles(_args: ListProfilesArgs) -> Result<()> {
+    for name in profile_names()? {
+        println!("{name}");
+    }
     Ok(())
 }
 

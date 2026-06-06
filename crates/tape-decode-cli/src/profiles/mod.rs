@@ -10,6 +10,10 @@ use serde_json::{Map, Value};
 
 use tape_decode::DecodeProfile;
 
+const SYS_PARAMS: &str = include_str!("sys_params.json");
+const FORMAT_PARAMS: &str = include_str!("format_params.json");
+const PROFILES: &str = include_str!("profiles.json");
+
 /// Clone an entry's key/value pairs, dropping the `base` inheritance marker.
 fn without_base(entry: &Map<String, Value>) -> Map<String, Value> {
     entry
@@ -169,10 +173,10 @@ fn expand_profile(
 /// `base` references against the named definitions in `format_params.json` and
 /// `sys_params.json`.
 fn load_profiles() -> Result<Map<String, Value>> {
-    let sys_param_defs = load_defs(include_str!("sys_params.json"), "sys_params")?;
-    let format_defs = load_defs(include_str!("format_params.json"), "format")?;
+    let sys_param_defs = load_defs(SYS_PARAMS, "sys_params")?;
+    let format_defs = load_defs(FORMAT_PARAMS, "format")?;
 
-    let mut profiles: Map<String, Value> = serde_json::from_str(include_str!("profiles.json"))?;
+    let mut profiles: Map<String, Value> = serde_json::from_str(PROFILES)?;
     let mut sys_param_cache: HashMap<String, Map<String, Value>> = HashMap::new();
     let mut format_cache: HashMap<String, Map<String, Value>> = HashMap::new();
     for (key, profile) in &mut profiles {
@@ -191,6 +195,14 @@ fn load_profiles() -> Result<Map<String, Value>> {
 
 fn deserialize_profile(profile: Value, source: &str) -> Result<DecodeProfile> {
     serde_json::from_value(profile).with_context(|| format!("failed to load profile {source}"))
+}
+
+/// Return the names of every embedded profile, sorted alphabetically.
+pub fn profile_names() -> Result<Vec<String>> {
+    let profiles: Map<String, Value> = serde_json::from_str(PROFILES)?;
+    let mut names: Vec<String> = profiles.into_iter().map(|(name, _)| name).collect();
+    names.sort();
+    Ok(names)
 }
 
 /// Look up a profile by name and deserialize it into a [`DecodeProfile`].
@@ -220,8 +232,8 @@ pub fn flatten_profile(profile: Option<&str>, profile_file: Option<&Path>) -> Re
                 .with_context(|| format!("failed to read profile file {}", path.display()))?;
             let mut profile: Value = serde_json::from_str(&data)
                 .with_context(|| format!("failed to parse profile file {}", path.display()))?;
-            let sys_param_defs = load_defs(include_str!("sys_params.json"), "sys_params")?;
-            let format_defs = load_defs(include_str!("format_params.json"), "format")?;
+            let sys_param_defs = load_defs(SYS_PARAMS, "sys_params")?;
+            let format_defs = load_defs(FORMAT_PARAMS, "format")?;
             let mut sys_param_cache: HashMap<String, Map<String, Value>> = HashMap::new();
             let mut format_cache: HashMap<String, Map<String, Value>> = HashMap::new();
             expand_profile(
