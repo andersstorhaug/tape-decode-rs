@@ -311,9 +311,9 @@ fn decide_field_order(
     let mut first_field = if inter_field_state.prev_first_field == -1 {
         interlaced_field_boundaries_detected == 0
             || (interlaced_field_boundaries_consensus as f64
-            / interlaced_field_boundaries_detected as f64)
-            .round_ties_even()
-            == 1.0
+                / interlaced_field_boundaries_detected as f64)
+                .round_ties_even()
+                == 1.0
             || fallback_is_first_field == 1
     } else {
         inter_field_state.prev_first_field == 0
@@ -518,9 +518,9 @@ fn get_first_hsync_loc(
     if first_vblank_valid_location_count != 0
         && last_vblank_valid_location_count != 0
         && first_vblank_hsync_estimate
-        < last_vblank_hsync_estimate + VSYNC_TOLERANCE_LINES * meanlinelen
+            < last_vblank_hsync_estimate + VSYNC_TOLERANCE_LINES * meanlinelen
         && first_vblank_hsync_estimate
-        > last_vblank_hsync_estimate - VSYNC_TOLERANCE_LINES * meanlinelen
+            > last_vblank_hsync_estimate - VSYNC_TOLERANCE_LINES * meanlinelen
     {
         first_hsync_loc = first_vblank_first_hsync_loc + last_vblank_first_hsync_loc;
         valid_location_count = first_vblank_valid_location_count + last_vblank_valid_location_count;
@@ -548,16 +548,16 @@ fn get_first_hsync_loc(
         valid_location_count = 1;
     } else if first_vblank_valid_location_count == 6
         || (inter_field_state.prev_first_hsync_loc <= 0.0
-        && first_vblank_valid_location_count != 0
-        && first_vblank_valid_location_count > last_vblank_valid_location_count)
+            && first_vblank_valid_location_count != 0
+            && first_vblank_valid_location_count > last_vblank_valid_location_count)
     {
         first_hsync_loc = first_vblank_first_hsync_loc;
         valid_location_count = first_vblank_valid_location_count;
         offset = first_vblank_offset;
     } else if last_vblank_valid_location_count == 6
         || (inter_field_state.prev_first_hsync_loc <= 0.0
-        && last_vblank_valid_location_count != 0
-        && last_vblank_valid_location_count > first_vblank_valid_location_count)
+            && last_vblank_valid_location_count != 0
+            && last_vblank_valid_location_count > first_vblank_valid_location_count)
     {
         first_hsync_loc = last_vblank_first_hsync_loc;
         valid_location_count = last_vblank_valid_location_count;
@@ -781,7 +781,10 @@ fn demod_std(data: &[f32], start: i64, end: i64) -> f64 {
 fn pulse_gap_stats(demod_05: &[f32], pulses: &[PulseSample], a: usize) -> (f64, f64) {
     let start = pulses[a].start + pulses[a].len + 40;
     let end = pulses[a + 1].start - 40;
-    (demod_mean(demod_05, start, end), demod_std(demod_05, start, end))
+    (
+        demod_mean(demod_05, start, end),
+        demod_std(demod_05, start, end),
+    )
 }
 
 fn get_line0_fallback(
@@ -920,7 +923,8 @@ fn get_line0_fallback(
 
             // if we couldn't detect field type based on half lines check phase
             if line_offset.is_none() {
-                let phase_cnt = count_phase_votes(&filtered_pulses, i, 15..=i.min(30), measured_linelen);
+                let phase_cnt =
+                    count_phase_votes(&filtered_pulses, i, 15..=i.min(30), measured_linelen);
                 // PAL:  for start of first field all values should be 1, for second field all should be 0
                 // NTSC: for start of first field all values should be 0, for second field all should be 1
                 let phase = argmax3(phase_cnt);
@@ -999,7 +1003,8 @@ fn get_line0_fallback(
             let measured_linelen =
                 (dis_ppspp + disp_pspp + dispp_spp + dispps_pp) * (linelen / 2.0);
             let mut line_offset = None;
-            let phase_cnt = count_phase_votes(&filtered_pulses, i, 10..=i.min(25), measured_linelen);
+            let phase_cnt =
+                count_phase_votes(&filtered_pulses, i, 10..=i.min(25), measured_linelen);
             // for start of first field all values should be 0, for second field all should be 1
             let phase = argmax3(phase_cnt);
             let mut candidate_first_field = 0;
@@ -1264,7 +1269,7 @@ fn get_line0_fallback(
     if let (Some(line0), Some(backup)) = (line_0, line_0_backup) {
         if line0 > line0_limit
             && (backup < line0 - (linelen * (frame_lines - 5) as f64 / 2.0)
-            || (relaxed && backup < line0_limit))
+                || (relaxed && backup < line0_limit))
         {
             line_0 = Some(backup);
             first_field = first_field_backup;
@@ -1484,7 +1489,7 @@ fn try_get_pulses_core(
                 hztoire(ire0, hz_ire, f64::from(data[0])) - 10.0,
             );
             let (pulses_starts, pulses_lengths) =
-                findpulses_raw(data, threshold, eq_pulselen / 8.0, long_pulse_max);
+                findpulses_raw(data, threshold as f32, eq_pulselen / 8.0, long_pulse_max);
             if let (Some(&start), Some(&len)) = (pulses_starts.first(), pulses_lengths.first()) {
                 raw_pulses[i] = PulseSample {
                     start: curpulse.start + start,
@@ -1497,8 +1502,8 @@ fn try_get_pulses_core(
         } else if i > 2
             && inrange(raw_pulses[i].len as f64, eq.0, eq.1)
             && valid_types
-            .last()
-            .is_some_and(|&pulse_type| pulse_type == PulseType::Hsync)
+                .last()
+                .is_some_and(|&pulse_type| pulse_type == PulseType::Hsync)
         {
             let start = i - 2;
             let end = (i + 24).min(raw_pulses.len());
@@ -1744,17 +1749,17 @@ fn findpulses_range(ire0: f64, hz_ire: f64, vsync_hz: f64, blank_hz: f64) -> (f6
 }
 
 fn get_serration_sync_levels(serration: &[f32]) -> (f64, f64) {
-    // The serration window is read from the f32 sync buffer; widening each
-    // sample to f64 here gives the same values the old f64 buffer held (f32->f64
-    // is lossless), so the returned (sync, blank) levels are bit-identical.
-    let half_amp = serration.iter().map(|&v| f64::from(v)).sum::<f64>() / serration.len() as f64;
-    let (mut peaks, mut valleys): (Vec<f64>, Vec<f64>) = serration
+    // The split threshold (the window mean) is accumulated in f64 so the
+    // partition boundary stays exact; the per-group medians run in f32.
+    let half_amp =
+        (serration.iter().map(|&v| f64::from(v)).sum::<f64>() / serration.len() as f64) as f32;
+    let (mut peaks, mut valleys): (Vec<f32>, Vec<f32>) = serration
         .iter()
-        .map(|&v| f64::from(v))
+        .copied()
         .partition(|&value| value > half_amp);
     (
-        median_from_values(&mut valleys),
-        median_from_values(&mut peaks),
+        f64::from(median_from_values(&mut valleys)),
+        f64::from(median_from_values(&mut peaks)),
     )
 }
 
@@ -1779,7 +1784,7 @@ fn argrelmin(data: &[f64]) -> Vec<i64> {
     out
 }
 
-fn sample_sign(value: f64) -> f64 {
+fn sample_sign(value: f32) -> f32 {
     if value > 0.0 {
         1.0
     } else if value < 0.0 {
@@ -1787,11 +1792,11 @@ fn sample_sign(value: f64) -> f64 {
     } else if value == 0.0 {
         0.0
     } else {
-        f64::NAN
+        f32::NAN
     }
 }
 
-fn zero_cross_det(data: &[f64]) -> Vec<i64> {
+fn zero_cross_det(data: &[f32]) -> Vec<i64> {
     let mut crossings = Vec::new();
     for i in 0..data.len().saturating_sub(1) {
         let diff = sample_sign(data[i + 1]) - sample_sign(data[i]);
@@ -1859,9 +1864,11 @@ fn vsyncserration_search_eq_pulses(
     let min_block_min = f64::from(min_block.iter().copied().fold(f32::INFINITY, f32::min));
     let level = (median_slice(min_block) - min_block_min) / 2.0 + min_block_min;
 
+    // Center in f64 (so the midpoint subtraction does not cancel two multi-MHz
+    // values) and carry the sign-crossing signal in f32.
     let zero_block = min_block
         .iter()
-        .map(|&sample| f64::from(sample) - level)
+        .map(|&sample| (f64::from(sample) - level) as f32)
         .collect::<Vec<_>>();
     let sync_pulses = zero_cross_det(&zero_block);
 
@@ -1897,8 +1904,8 @@ fn vsyncserration_search_eq_pulses(
     (true, Some(data_s), Some(levels))
 }
 
-fn vsync_serration_filt(coeffs: &(Vec<f64>, Vec<f64>), x: &[f64]) -> Vec<f64> {
-    filtfilt_with::<f64, f64>(&coeffs.0, &coeffs.1, x)
+fn vsync_serration_filt(sos: &[Sos<f64>], x: &[f64]) -> Vec<f64> {
+    sosfiltfilt_f64(sos, x)
 }
 
 // Builds the vsync envelope (lowpass of the rectified signal, plus the
@@ -2030,15 +2037,15 @@ fn findpulses_arr_reduced(
     let min_len = (eq_pulselen / 8.0) / divisor as f64;
     let max_len = long_pulse_max / divisor as f64;
 
-    // `sync_ref` is already f32; keep the decimated buffer in f32 (findpulses_raw
-    // is generic and widens each sample to f64 for the threshold test, so this is
-    // bit-exact) to halve this field/divisor-sized buffer.
+    // `sync_ref` is already f32; keep the decimated buffer in f32 to halve this
+    // field/divisor-sized buffer.
     let reduced = sync_ref
         .iter()
         .step_by(divisor as usize)
         .copied()
         .collect::<Vec<f32>>();
-    let (mut pulses_starts, mut pulses_lengths) = findpulses_raw(&reduced, high, min_len, max_len);
+    let (mut pulses_starts, mut pulses_lengths) =
+        findpulses_raw(&reduced, high as f32, min_len, max_len);
 
     for start in &mut pulses_starts {
         *start *= divisor;
@@ -2061,14 +2068,15 @@ fn check_levels(ctx: &GpCtx, data: &[f32], new_sync: f64, new_blank: f64) -> boo
     }
 
     let len = data.len() as f64;
+    let new_sync_f = new_sync as f32;
+    let new_blank_f = new_blank as f32;
     let mut below_sync = 0usize;
     let mut below_blank = 0usize;
     for &sample in data {
-        let sample = f64::from(sample);
-        if sample < new_sync {
+        if sample < new_sync_f {
             below_sync += 1;
         }
-        if sample < new_blank {
+        if sample < new_blank_f {
             below_blank += 1;
         }
     }
@@ -2270,7 +2278,7 @@ impl ResyncState {
                     iretohz(ire0, hz_ire, f64::from(config.sys_vsync_ire)),
                     iretohz(ire0, hz_ire, 0.0),
                 )
-                    .1
+                .1
             },
         }
     }
@@ -2368,10 +2376,7 @@ impl ResyncState {
             blank = b.unwrap();
         } else {
             let ire_step = 5.0;
-            let mut min_sync = demod_05
-                .iter()
-                .map(|&sample| f64::from(sample))
-                .fold(f64::INFINITY, f64::min);
+            let mut min_sync = f64::from(demod_05.iter().copied().fold(f32::INFINITY, f32::min));
             let mut retries = 30;
             let vsync_len_px = Self::vsync_len_px(ctx);
             let min_vsync_check = vsync_len_px * 0.8;
@@ -2442,7 +2447,7 @@ impl ResyncState {
                             );
                             let r = findpulses_raw(
                                 demod_05,
-                                pulse_hz_max,
+                                pulse_hz_max as f32,
                                 config.resync_eq_pulselen() as f64 / 8.0,
                                 long_pulse_max,
                             );
@@ -2476,7 +2481,7 @@ impl ResyncState {
         let (_, pulse_hz_max) = findpulses_range(ctx.sp_ire0, ctx.sp_hz_ire, sync, blank);
         let (pulses_starts, pulses_lengths) = findpulses_raw(
             demod_05,
-            pulse_hz_max,
+            pulse_hz_max as f32,
             config.resync_eq_pulselen() as f64 / 8.0,
             config.resync_long_pulse_max(),
         );
@@ -2537,12 +2542,13 @@ impl ResyncState {
                 blank = b.unwrap();
             }
             let dc_offset = ctx.sp_ire0 - blank;
+            let dc_offset_f = dc_offset as f32;
             for v in sync_reference.iter_mut() {
-                *v = (f64::from(*v) + dc_offset) as f32;
+                *v += dc_offset_f;
             }
             if !ctx.disable_dc_offset {
                 for v in demod_data.iter_mut() {
-                    *v = (f64::from(*v) + dc_offset) as f32;
+                    *v += dc_offset_f;
                 }
             }
             sync += dc_offset;
@@ -2552,7 +2558,7 @@ impl ResyncState {
                 sync,
                 iretohz(ctx.sp_ire0, ctx.sp_hz_ire, 0.0),
             )
-                .1;
+            .1;
         } else {
             let (pulse_hz_min, phm) = findpulses_range(
                 ctx.sp_ire0,
@@ -2571,18 +2577,21 @@ impl ResyncState {
             if !(ctx.disable_dc_offset || pulse_hz_min < new_sync && new_sync < ctx.sp_vsync_hz)
                 && check
             {
+                // Fold the recentering constants once so the per-sample shift is
+                // a single f32 add instead of a widened subtract-and-add.
+                let recenter = (ctx.sp_vsync_hz - new_sync) as f32;
                 for v in sync_reference.iter_mut() {
-                    *v = (f64::from(*v) - new_sync + ctx.sp_vsync_hz) as f32;
+                    *v += recenter;
                 }
                 for v in demod_data.iter_mut() {
-                    *v = (f64::from(*v) - new_sync + ctx.sp_vsync_hz) as f32;
+                    *v += recenter;
                 }
             }
         }
         self.last_pulse_threshold = pulse_hz_max;
         let (starts, lengths) = findpulses_raw(
             sync_reference,
-            pulse_hz_max,
+            pulse_hz_max as f32,
             config.resync_eq_pulselen() as f64 / 8.0,
             config.resync_long_pulse_max(),
         );

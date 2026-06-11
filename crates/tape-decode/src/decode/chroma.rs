@@ -9,13 +9,13 @@ fn adjust_phase(
     assert_eq!(input_data.len(), output_data.len());
 
     let phase_adjustment = target_phase.to_radians() - input_phase.to_radians();
-    let rotation_re = phase_adjustment.cos();
-    let rotation_im = phase_adjustment.sin();
+    // The rotation factors are computed once in f64 for accuracy, then the
+    // per-sample mix runs in f32 over the already-f32 analytic signal.
+    let rotation_re = phase_adjustment.cos() as f32;
+    let rotation_im = phase_adjustment.sin() as f32;
 
     for (input, output) in input_data.iter().zip(output_data.iter_mut()) {
-        let re = f64::from(input.re);
-        let im = f64::from(input.im);
-        *output = (re * rotation_re - im * rotation_im) as f32;
+        *output = input.re * rotation_re - input.im * rotation_im;
     }
 }
 
@@ -28,7 +28,7 @@ fn acc(
     lines: usize,
 ) -> Vec<u16> {
     const STARTING_LINE: usize = 16;
-    const SIGNED_SAMPLE_MAX: f64 = 32767.0;
+    const SIGNED_SAMPLE_MAX: f32 = 32767.0;
     assert!(lines > STARTING_LINE);
 
     // Burst-normalize each line and encode it straight to the u16 output in one
@@ -37,7 +37,7 @@ fn acc(
     // encoded that to the 32767 zero level, so initialize them to that level and
     // overwrite the normalized region in place. This drops the intermediate
     // field-sized f32 buffer and the separate encode pass that re-read it.
-    let zero_level = (SIGNED_SAMPLE_MAX as i64) as u16;
+    let zero_level = SIGNED_SAMPLE_MAX as u16;
     let mut output = vec![zero_level; chroma.len()];
 
     for linenumber in STARTING_LINE..lines {
@@ -52,7 +52,7 @@ fn acc(
         };
         for (out, &sample) in output[linestart..lineend].iter_mut().zip(line.iter()) {
             let scaled = sample * scale;
-            *out = ((f64::from(scaled) + SIGNED_SAMPLE_MAX) as i64) as u16;
+            *out = ((scaled + SIGNED_SAMPLE_MAX) as i64) as u16;
         }
     }
 
@@ -82,7 +82,7 @@ fn upconvert_chroma(
 
         let heterodyne_row = &chroma_heterodyne[current_phase];
         for i in start..end {
-            uphet[i] = (f64::from(chroma[i]) * f64::from(heterodyne_row[i])) as f32;
+            uphet[i] = chroma[i] * heterodyne_row[i];
         }
     }
 
@@ -95,7 +95,7 @@ fn burst_deemphasis(chroma: &mut [f32], field: &DecodedField, burstarea_end: usi
         let linestart = (line - lineoffset) * field.outlinelen;
         let lineend = linestart + field.outlinelen;
         for sample in &mut chroma[linestart + burstarea_end + 5..lineend] {
-            *sample = (f64::from(*sample) * 2.0) as f32;
+            *sample *= 2.0;
         }
     }
 }
@@ -134,8 +134,7 @@ fn comb_c(data: &mut [f32], line_len: usize, line_distance: usize) {
                 ring[slot + offset]
             };
             ring[slot + offset] = current;
-            data[i] = ((f64::from(current) * 2.0 - f64::from(advanced) - f64::from(delayed_sample))
-                / 4.0) as f32;
+            data[i] = (current * 2.0 - advanced - delayed_sample) / 4.0;
         }
     }
 }
@@ -156,8 +155,6 @@ fn process_chroma_internal(
             chroma_len,
             Some((10.0 * (spec.sys_outfreq / 40.0)) as isize),
         );
-        // The AFC center-frequency measurement reads the f32 chroma and widens
-        // each sample back to f64 inside its filtfilt chain.
         chroma_afc_state.freq_offset(spec, &chroma, true)?;
         chroma
     } else {
@@ -187,8 +184,8 @@ fn process_chroma_internal(
 
     uphet = sosfiltfilt_f32(&spec.chroma_filter_final, &uphet);
 
-    if let Some((b, a)) = spec.chroma_filter_deemphasis.as_ref() {
-        uphet = lfilter_f32::<false>(b, a, &uphet, &[]).0;
+    if let Some(sos) = spec.chroma_filter_deemphasis.as_ref() {
+        uphet = sosfilt_f32(sos, &uphet);
     }
 
     if !spec.rf_disable_comb {

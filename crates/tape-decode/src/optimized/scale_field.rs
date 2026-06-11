@@ -39,11 +39,256 @@ pub(crate) fn scale_field(
     let (interp_t, interp_c) = make_interp_spline_scaled(expected_linelocs, actual_linelocs, k)?;
     let spline = (interp_t.as_slice(), interp_c.as_slice());
     Ok(match k {
-        1 => scale_field_k::<1>(buf, out_len, spline, &params),
+        1 => scale_field_linear(buf, out_len, spline, &params),
         2 => scale_field_k::<2>(buf, out_len, spline, &params),
         3 => scale_field_k::<3>(buf, out_len, spline, &params),
         _ => unreachable!("unsupported spline degree"),
     })
+}
+
+fn level_adjust_threshold_value(level_adjust_threshold: f64, mad: f64) -> f64 {
+    if mad > 0.0 {
+        level_adjust_threshold * mad
+    } else {
+        0.001 * WOW_FACTOR_SCALE
+    }
+}
+
+fn level_adjusted(packed: i32, median: f64, threshold: f64) -> f64 {
+    if (packed as f64 - median).abs() > threshold {
+        unpack_wow_factor(median)
+    } else {
+        unpack_wow_factor(packed as f64)
+    }
+}
+
+#[inline]
+fn catmull_rom4(p0: f32, p1: f32, p2: f32, p3: f32, x: f32) -> f32 {
+    let a = p2 - p0;
+    let b = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
+    let c = 3.0 * (p1 - p2) + p3 - p0;
+    // Horner form via fused multiply-add: p1 + 0.5*x*(a + x*(b + x*c)).
+    let poly = c.mul_add(x, b).mul_add(x, a);
+    (0.5 * x).mul_add(poly, p1)
+}
+
+/// One knot span of the degree-1 spline, with everything that is constant
+/// across the span hoisted out: the value lerp endpoints and the (constant)
+/// derivative.
+#[derive(Clone, Copy)]
+struct LinSpan {
+    t0: f64,
+    t1: f64,
+    inv_h: f64,
+    c0: f64,
+    c1: f64,
+    deriv: f64,
+}
+
+fn lin_span(t: &[f64], c: &[f64], s: usize) -> LinSpan {
+    let t0 = t[s];
+    let t1 = t[s + 1];
+    let inv_h = 1.0 / (t1 - t0);
+    let c0 = c[s - 1];
+    let c1 = c[s];
+    LinSpan {
+        t0,
+        t1,
+        inv_h,
+        c0,
+        c1,
+        deriv: (c1 - c0) * inv_h,
+    }
+}
+
+/// First eval index in `[lo, hi]` whose sample position `idx * eval_scale`
+/// reaches `bound`. The position is monotone in the index, so the fix-up walks
+/// land on the exact crossover even when the seeding division rounds.
+fn first_index_reaching(bound: f64, eval_scale: f64, lo: usize, hi: usize) -> usize {
+    let mut idx = ((bound / eval_scale) as usize).clamp(lo, hi);
+    while idx > lo && (idx - 1) as f64 * eval_scale >= bound {
+        idx -= 1;
+    }
+    while idx < hi && (idx as f64) * eval_scale < bound {
+        idx += 1;
+    }
+    idx
+}
+
+/// Value holding the given 0-based rank in a run-length encoded sorted list.
+fn rank_value<T: Copy>(pairs: &[(T, u32)], rank: usize) -> T {
+    let mut before = 0usize;
+    for &(value, count) in pairs {
+        let next = before + count as usize;
+        if next > rank {
+            return value;
+        }
+        before = next;
+    }
+    unreachable!("rank outside run-length counts")
+}
+
+/// Median (mean of the two middle order statistics for an even total) of a
+/// run-length encoded multiset, matching `radix_median_by_key` exactly.
+fn weighted_median<T: Copy + Ord>(
+    pairs: &mut [(T, u32)],
+    total: usize,
+    decode: impl Fn(T) -> f64,
+) -> f64 {
+    assert!(total > 0);
+    pairs.sort_unstable_by_key(|pair| pair.0);
+    let upper_index = total / 2;
+    let upper = decode(rank_value(pairs, upper_index));
+    if !total.is_multiple_of(2) {
+        return upper;
+    }
+    let lower = decode(rank_value(pairs, upper_index - 1));
+    (lower + upper) / 2.0
+}
+
+/// Degree-1 (default) specialization of `scale_field_k`. The linear spline has
+/// a constant derivative inside each knot span, so the wow factor, its packed
+/// form, and the level-adjust threshold decision are all span-invariant: hoist
+/// them and walk the output span by span. The median/MAD gather collapses the
+/// same way, from one spline evaluation per output sample to one
+/// `(value, count)` run per span fed to an exact weighted median.
+fn scale_field_linear(
+    buf: &[f32],
+    out_len: usize,
+    spline: (&[f64], &[f64]),
+    params: &ScaleFieldParams,
+) -> (Vec<f32>, f64, f64) {
+    const K: usize = 1;
+    let ScaleFieldParams {
+        eval_scale,
+        eval_count,
+        lineoffset,
+        outwidth,
+        wow_level_adjust_smoothing,
+        level_adjust_threshold,
+        cached_median_mad,
+    } = *params;
+    let lineoffset_out_samples = outwidth * (lineoffset + 1);
+    let required_eval_count = lineoffset_out_samples + out_len;
+    assert!(required_eval_count <= eval_count);
+
+    let (t, c) = spline;
+    let nt = t.len() - K - 1;
+
+    let (median, mad) = cached_median_mad.unwrap_or_else(|| {
+        assert!(eval_count > 0);
+        // Each span contributes one packed wow factor, repeated once per eval
+        // index that falls inside it — the same multiset the per-sample walk
+        // produced, so the medians are bit-identical.
+        let mut pairs: Vec<(i32, u32)> = Vec::with_capacity(nt);
+        let mut idx = 0usize;
+        for span in K..nt {
+            if idx >= eval_count {
+                break;
+            }
+            let sp = lin_span(t, c, span);
+            let end = if span + 1 < nt {
+                first_index_reaching(sp.t1, eval_scale, idx, eval_count)
+            } else {
+                eval_count
+            };
+            if end > idx {
+                pairs.push((pack_wow_factor(sp.deriv), (end - idx) as u32));
+                idx = end;
+            }
+        }
+        let median = weighted_median(&mut pairs, eval_count, |value| value as f64);
+        let mut diff_pairs: Vec<(u32, u32)> = pairs
+            .iter()
+            .map(|&(value, count)| (wow_factor_abs_diff(value, median), count))
+            .collect();
+        let mad = weighted_median(&mut diff_pairs, eval_count, f64::from);
+        (median, mad)
+    });
+
+    let threshold = level_adjust_threshold_value(level_adjust_threshold, mad);
+    let smoothing_enabled = wow_level_adjust_smoothing > 0.0;
+    let (alpha, one_minus_alpha) = if smoothing_enabled {
+        let alpha = 1.0 / (f64::from(wow_level_adjust_smoothing) * outwidth as f64);
+        (alpha, 1.0 - alpha)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // Warmup smoothing over the lead-in samples. This walk is a tiny fraction
+    // of the field, so it keeps the straightforward per-sample evaluation.
+    let mut warmup_span = K;
+    let initial = eval_spline_value_deriv_k::<K>(t, c, nt, &mut warmup_span, 0.0).1;
+    let mut smoothed_adjust = level_adjusted(pack_wow_factor(initial), median, threshold);
+    if smoothing_enabled && lineoffset_out_samples > 1 {
+        for index in 1..lineoffset_out_samples {
+            let deriv = eval_spline_value_deriv_k::<K>(
+                t,
+                c,
+                nt,
+                &mut warmup_span,
+                index as f64 * eval_scale,
+            )
+            .1;
+            smoothed_adjust = alpha.mul_add(
+                level_adjusted(pack_wow_factor(deriv), median, threshold),
+                one_minus_alpha * smoothed_adjust,
+            );
+        }
+    }
+
+    if outwidth == 0 {
+        return (Vec::new(), median, mad);
+    }
+
+    let mut dsout = Vec::with_capacity(out_len);
+    let mut span = K;
+    let end_eval = lineoffset_out_samples + out_len;
+    let mut idx = lineoffset_out_samples;
+    while idx < end_eval {
+        // Re-derive the span exactly the way the per-sample evaluation did,
+        // then run every sample that stays inside it with the hoisted state.
+        let x = idx as f64 * eval_scale;
+        if x <= t[K] {
+            span = K;
+        } else if x >= t[nt] {
+            span = nt - 1;
+        } else {
+            while span + 1 < nt && x >= t[span + 1] {
+                span += 1;
+            }
+        }
+        let sp = lin_span(t, c, span);
+        let run_end = if span + 1 < nt {
+            first_index_reaching(sp.t1, eval_scale, idx + 1, end_eval)
+        } else {
+            end_eval
+        };
+        let raw_adjust = level_adjusted(pack_wow_factor(sp.deriv), median, threshold);
+        let alpha_raw = alpha * raw_adjust;
+        for eval_index in idx..run_end {
+            let x = eval_index as f64 * eval_scale;
+            let b0 = (sp.t1 - x) * sp.inv_h;
+            let b1 = (x - sp.t0) * sp.inv_h;
+            let coord = b0 * sp.c0 + b1 * sp.c1;
+            let level_adjust = if smoothing_enabled {
+                if eval_index == 0 {
+                    smoothed_adjust = raw_adjust;
+                } else {
+                    smoothed_adjust = one_minus_alpha.mul_add(smoothed_adjust, alpha_raw);
+                }
+                smoothed_adjust
+            } else {
+                raw_adjust
+            };
+            let coord_int = coord as usize;
+            let w = &buf[coord_int - 1..coord_int + 3];
+            let x = (coord - coord_int as f64) as f32;
+            dsout.push(level_adjust as f32 * catmull_rom4(w[0], w[1], w[2], w[3], x));
+        }
+        idx = run_end;
+    }
+    (dsout, median, mad)
 }
 
 fn scale_field_k<const K: usize>(
@@ -87,19 +332,8 @@ fn scale_field_k<const K: usize>(
         (median, median_wow_factor_abs_diff(&wow_packed, median))
     });
 
-    let threshold = if mad > 0.0 {
-        level_adjust_threshold * mad
-    } else {
-        0.001 * WOW_FACTOR_SCALE
-    };
-
-    let adjusted = |value: i32| -> f64 {
-        if (value as f64 - median).abs() > threshold {
-            unpack_wow_factor(median)
-        } else {
-            unpack_wow_factor(value as f64)
-        }
-    };
+    let threshold = level_adjust_threshold_value(level_adjust_threshold, mad);
+    let adjusted = |value: i32| -> f64 { level_adjusted(value, median, threshold) };
     let smoothing_enabled = wow_level_adjust_smoothing > 0.0;
     let (alpha, one_minus_alpha) = if smoothing_enabled {
         let alpha = 1.0 / (f64::from(wow_level_adjust_smoothing) * outwidth as f64);
@@ -159,19 +393,11 @@ fn scale_field_k<const K: usize>(
         let coord_int = coord as usize;
 
         let w = &buf[coord_int - 1..coord_int + 3];
-        let p0 = f64::from(w[0]);
-        let p1 = f64::from(w[1]);
-        let p2 = f64::from(w[2]);
-        let p3 = f64::from(w[3]);
-        let x = coord - coord_int as f64;
-
-        let a = p2 - p0;
-        let b = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
-        let c = 3.0 * (p1 - p2) + p3 - p0;
-        // Horner form via fused multiply-add: p1 + 0.5*x*(a + x*(b + x*c)).
-        let poly = c.mul_add(x, b).mul_add(x, a);
-        let scaled = (0.5 * x).mul_add(poly, p1);
-        dsout.push((level_adjust * scaled) as f32);
+        // `coord` carries the full sample position (up to the field length), so the
+        // fractional offset is taken in f64; the Catmull-Rom cubic itself then
+        // evaluates in f32 over the already-f32 luma samples.
+        let x = (coord - coord_int as f64) as f32;
+        dsout.push(level_adjust as f32 * catmull_rom4(w[0], w[1], w[2], w[3], x));
     }
     (dsout, median, mad)
 }
@@ -288,6 +514,21 @@ fn eval_spline_value_deriv_k<const K: usize>(
         while *span + 1 < nt && x >= t[*span + 1] {
             *span += 1;
         }
+    }
+    // The degree-1 (linear) spline is the default wow-interpolation mode and the
+    // hot caller here. Its two basis functions are straight lines, so evaluate
+    // them and their derivatives in closed form rather than running the general
+    // `bspline_ders_basis` recurrence (with its 4x4 scratch arrays and factor
+    // passes) for what reduces to a lerp. `K` is a const generic, so the branch
+    // is resolved at compile time.
+    if K == 1 {
+        let s = *span;
+        let inv_h = 1.0 / (t[s + 1] - t[s]);
+        let b0 = (t[s + 1] - x) * inv_h;
+        let b1 = (x - t[s]) * inv_h;
+        let c0 = c[s - 1];
+        let c1 = c[s];
+        return (b0 * c0 + b1 * c1, (c1 - c0) * inv_h);
     }
     let ders = bspline_ders_basis::<K>(t, *span, x, 1);
     let cofs = &c[*span - K..=*span];

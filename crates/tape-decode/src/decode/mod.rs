@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use crate::optimized::{
-    lfilter, lfilter_f32, scale_field, sosfiltfilt_f32, unwrap_angles, ScaleFieldParams,
+    exp_fast, narrow_sos, powf_fast_nonneg, scale_field, sosfilt_f32, sosfiltfilt_f32,
+    sosfiltfilt_f64, sum_algebraic, unwrap_angles, ScaleFieldParams,
 };
 use crate::request::{ColorSystem, FieldOrderAction, LineSystem, WowInterpolation};
-use crate::spec::{DecoderSpec, VideoEqConfig};
-use crate::vec_utils::convert_vec_in_place;
+use crate::spec::DecoderSpec;
 use crate::DeterministicHashMap;
 use anyhow::{bail, Context as _, Result};
 use num_traits::{Float, ToPrimitive};
+use realfft::{ComplexToReal, RealToComplex};
 use rustfft::num_complex::{Complex32, ComplexFloat};
 use rustfft::Fft;
 use sci_rs::signal::filter::design::{FilterBandType, Sos};
@@ -118,21 +119,21 @@ where
     }
 }
 
-fn median_from_values(values: &mut [f64]) -> f64 {
+fn median_from_values<T: Float>(values: &mut [T]) -> T {
     if values.is_empty() {
-        return f64::NAN;
+        return T::nan();
     }
     // Quickselect (O(n) avg) instead of a full sort: we only need the middle
     // order statistic(s), and selecting the k-th element yields the same value
     // a full sort would place at index k for the same comparator.
-    let cmp = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater);
+    let cmp = |a: &T, b: &T| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater);
     let mid = values.len() / 2;
     if values.len().is_multiple_of(2) {
         let (left, &mut hi, _) = values.select_nth_unstable_by(mid, cmp);
         // Lower middle element is the maximum of the partition below `mid`,
         // ranked by the same comparator used for selection.
         let lo = *left.iter().max_by(|a, b| cmp(a, b)).unwrap();
-        (lo + hi) / 2.0
+        (lo + hi) / (T::one() + T::one())
     } else {
         let (_, &mut median, _) = values.select_nth_unstable_by(mid, cmp);
         median
@@ -214,11 +215,7 @@ fn cafc_fft_center_freq(spec: &DecoderSpec, data: &[f32]) -> Result<(f64, f64)> 
     // lines.
     let power: Vec<f32> = sig_fft
         .iter()
-        .map(|sample| {
-            let re = f64::from(sample.re);
-            let im = f64::from(sample.im);
-            re.mul_add(re, im * im) as f32
-        })
+        .map(|sample| sample.re.mul_add(sample.re, sample.im * sample.im))
         .collect();
     let max_power = power.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let clip_min = (f64::from(max_power) * DecoderSpec::CHROMA_AFC_POWER_THRESHOLD) as f32;
@@ -308,132 +305,24 @@ pub(crate) fn gen_chroma_heterodyne(
 ) -> Vec<Vec<f32>> {
     use std::f64::consts::TAU;
     let angle_step = TAU * het_wave_scale;
+
     let mut phase0 = Vec::with_capacity(field_len);
     let mut phase1 = Vec::with_capacity(field_len);
     let mut phase2 = Vec::with_capacity(field_len);
     let mut phase3 = Vec::with_capacity(field_len);
 
     for i in 0..field_len {
-        let (sin, cos) = (angle_step * i as f64 + phase_drift).sin_cos();
-        phase0.push(-cos as f32);
-        phase1.push(sin as f32);
-        phase2.push(cos as f32);
-        phase3.push(-sin as f32);
+        // Reduce the (large, accumulating) carrier phase modulo a turn before
+        // narrowing, so the carrier itself is evaluated over a small argument.
+        let reduced = (angle_step * i as f64 + phase_drift).rem_euclid(TAU) as f32;
+        let (sin, cos) = reduced.sin_cos();
+        phase0.push(-cos);
+        phase1.push(sin);
+        phase2.push(cos);
+        phase3.push(-sin);
     }
 
     vec![phase0, phase1, phase2, phase3]
-}
-
-/// Construct initial conditions for lfilter's step-response steady state using
-/// the explicit companion-form solution.
-pub(crate) fn lfilter_zi(b: &[f64], a: &[f64]) -> Vec<f64> {
-    let mut a = a.to_vec();
-    let mut b = b.to_vec();
-    while a.len() > 1 && a[0] == 0.0 {
-        a.remove(0);
-    }
-    assert!(!a.is_empty());
-
-    if a[0] != 1.0 {
-        // Normalize the coefficients so a[0] == 1.
-        let a0 = a[0];
-        for v in b.iter_mut() {
-            *v /= a0;
-        }
-        for v in a.iter_mut() {
-            *v /= a0;
-        }
-    }
-
-    let n = a.len().max(b.len());
-    a.resize(n, 0.0);
-    b.resize(n, 0.0);
-
-    if n < 2 {
-        return Vec::new();
-    }
-
-    // Solve zi = A*zi + B with A = companion(a).T using the explicit formula.
-    // B = b[1:] - a[1:]*b[0]; IminusA[:,0].sum() == sum(a) (since a[0] == 1).
-    let b_sum: f64 = (1..n).map(|i| b[i] - a[i] * b[0]).sum();
-    let denom: f64 = a.iter().sum();
-    let mut zi = vec![0.0; n - 1];
-    zi[0] = b_sum / denom;
-    let mut asum = 1.0;
-    let mut csum = 0.0;
-    for k in 1..n - 1 {
-        asum += a[k];
-        csum += b[k] - a[k] * b[0];
-        zi[k] = asum * zi[0] - csum;
-    }
-    zi
-}
-
-/// Odd extension at the boundaries of an array. The extension is computed in
-/// f64 so the forward/backward recurrence keeps full precision even when the
-/// caller's samples are stored as f32.
-fn odd_ext<T>(x: &[T], n: usize) -> Vec<f64>
-where
-    T: Float,
-{
-    let len = x.len();
-    let left_end = x[0].to_f64().unwrap();
-    let right_end = x[len - 1].to_f64().unwrap();
-    if n < 1 {
-        return x.iter().map(|&v| v.to_f64().unwrap()).collect();
-    }
-    let mut ext = Vec::with_capacity(len + 2 * n);
-    // 2*left_end - x[n], x[n-1], ..., x[1]
-    for i in (1..=n).rev() {
-        ext.push(2.0 * left_end - x[i].to_f64().unwrap());
-    }
-    ext.extend(x.iter().map(|&v| v.to_f64().unwrap()));
-    // 2*right_end - x[len-2], x[len-3], ..., x[len-n-1]
-    for i in 1..=n {
-        ext.push(2.0 * right_end - x[len - 1 - i].to_f64().unwrap());
-    }
-    ext
-}
-
-/// Apply a digital filter forward and backward to a signal (BA form) with odd
-/// boundary padding. The recurrence runs in f64; the result is narrowed to the
-/// requested output type `O`.
-fn filtfilt_with<T, O>(b: &[f64], a: &[f64], x: &[T]) -> Vec<O>
-where
-    T: Float,
-    O: Float,
-{
-    let ntaps = a.len().max(b.len());
-    let edge = ntaps * 3;
-    assert!(x.len() > edge);
-
-    // Odd extension of the input.
-    let ext = odd_ext(x, edge);
-
-    // Get the steady state of the filter's step response.
-    let zi = lfilter_zi(b, a);
-    let x0 = ext[0];
-    let zi_x0: Vec<f64> = zi.iter().map(|&z| z * x0).collect();
-
-    // Forward filter.
-    let y = lfilter::<false, _>(b, a, &ext, &zi_x0).0;
-
-    // Backward filter.
-    let y0 = y[y.len() - 1];
-    let zi_y0: Vec<f64> = zi.iter().map(|&z| z * y0).collect();
-    let y_rev: Vec<f64> = y.into_iter().rev().collect();
-    let mut y2 = lfilter::<false, _>(b, a, &y_rev, &zi_y0).0;
-
-    // Reverse and slice the actual signal from the extended signal.
-    y2.reverse();
-    y2.copy_within(edge..edge + x.len(), 0);
-    y2.truncate(x.len());
-    convert_vec_in_place(y2, |v| O::from(v).unwrap())
-}
-
-/// f32-output convenience wrapper around [`filtfilt_with`].
-fn filtfilt_f32(b: &[f64], a: &[f64], x: &[f32]) -> Vec<f32> {
-    filtfilt_with::<f32, f32>(b, a, x)
 }
 
 pub(crate) fn butter_sos(
@@ -490,10 +379,8 @@ fn shift_chroma_and_remove_dc(mut output: Vec<f32>, move_by: isize) -> Vec<f32> 
 
     roll(&mut output, move_by);
 
-    // Accumulate the mean in f64 even though the chroma samples are stored as
-    // f32, matching the precision of the previous f64 `mean()` reduction.
-    let sum: f64 = output.iter().map(|&sample| f64::from(sample)).sum();
-    let mean = (sum / output.len() as f64) as f32;
+    let sum: f32 = output.iter().copied().sum();
+    let mean = sum / output.len() as f32;
     for sample in output.iter_mut() {
         *sample -= mean;
     }
@@ -618,40 +505,68 @@ fn demod_mean(data: &[f32], start: i64, end: i64) -> f64 {
     let Some((start, end)) = demod_slice_bounds(data.len(), start, end) else {
         return f64::NAN;
     };
-    mean_slice(&data[start..end])
+    let slice = &data[start..end];
+    f64::from(slice.iter().sum::<f32>() / slice.len() as f32)
 }
 
 type PhaseSequenceEntry = (usize, usize, f64, f64, f64, f64);
 
+// Whether any sample in the chunk sits on the given side of the threshold,
+// as a branch-free OR-reduction the compiler vectorizes.
+#[inline]
+fn chunk_crosses(chunk: &[f32], high: f32, above: bool) -> bool {
+    if above {
+        chunk.iter().fold(false, |acc, &value| acc | (value > high))
+    } else {
+        chunk
+            .iter()
+            .fold(false, |acc, &value| acc | (value <= high))
+    }
+}
+
 fn findpulses_raw(
     sync_ref: &[f32],
-    high: f64,
+    high: f32,
     min_synclen: f64,
     max_synclen: f64,
 ) -> (Vec<i64>, Vec<i64>) {
-    let mut in_pulse = f64::from(sync_ref[0]) <= high;
+    let mut in_pulse = sync_ref[0] <= high;
     let mut starts = Vec::new();
     let mut lengths = Vec::new();
     let mut cur_start = 0usize;
 
-    for (pos, &value) in sync_ref.iter().enumerate() {
-        let value = f64::from(value);
-        if in_pulse {
-            if value > high {
-                let length = pos - cur_start;
-                if (length as f64) >= min_synclen
-                    && (length as f64) <= max_synclen
-                    && cur_start != 0
-                {
-                    starts.push(cur_start as i64);
-                    lengths.push(length as i64);
-                }
-                in_pulse = false;
-            }
-        } else if value <= high {
-            cur_start = pos;
-            in_pulse = true;
+    // The signal crosses the threshold only a few hundred times per field, so
+    // first test whole chunks for a crossing out of the current state and run
+    // the per-sample edge logic only on the chunks that contain one.
+    const CHUNK: usize = 64;
+    let mut pos = 0usize;
+    let n = sync_ref.len();
+    while pos < n {
+        let end = (pos + CHUNK).min(n);
+        let chunk = &sync_ref[pos..end];
+        if !chunk_crosses(chunk, high, in_pulse) {
+            pos = end;
+            continue;
         }
+        for (offset, &value) in chunk.iter().enumerate() {
+            if in_pulse {
+                if value > high {
+                    let length = pos + offset - cur_start;
+                    if (length as f64) >= min_synclen
+                        && (length as f64) <= max_synclen
+                        && cur_start != 0
+                    {
+                        starts.push(cur_start as i64);
+                        lengths.push(length as i64);
+                    }
+                    in_pulse = false;
+                }
+            } else if value <= high {
+                cur_start = pos + offset;
+                in_pulse = true;
+            }
+        }
+        pos = end;
     }
 
     (starts, lengths)
@@ -667,7 +582,7 @@ fn chromasep_comb(data: &[f32], delay: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(len);
     for i in 0..len {
         let delayed = data[(i + len - delay) % len];
-        output.push(((f64::from(data[i]) + f64::from(delayed)) * 0.5) as f32);
+        output.push((data[i] + delayed) * 0.5);
     }
     output
 }
@@ -769,40 +684,6 @@ impl StackableMa {
     }
 }
 
-// Mutable video-EQ IIR delay state; immutable coefficients live in VideoEqConfig.
-
-// Mutable IIR delay state, carried across blocks/fields.
-struct VideoEqState {
-    z: Vec<f64>,
-}
-
-impl VideoEqState {
-    fn new(config: &VideoEqConfig) -> Self {
-        VideoEqState {
-            z: config.initial_z.clone(),
-        }
-    }
-
-    // It enhances the upper band of the video signal. The demod signal is stored
-    // as f32, so this consumes and produces f32 directly (the filtfilt/lfilter
-    // recurrences still run in f64); that drops the block-sized f64 widening copy
-    // the caller would otherwise need.
-    fn filter_video(&mut self, config: &VideoEqConfig, demod: &[f32]) -> Vec<f32> {
-        let overlap = 10; // how many samples the edge distortion produces
-        let ha = filtfilt_f32(&config.b, &config.a, demod);
-        let head = &demod[..overlap.min(demod.len())];
-        let (hb, new_z) = lfilter::<true, _>(&config.b, &config.a, head, &self.z);
-        self.z = new_z;
-        let mut result = Vec::with_capacity(demod.len());
-        for i in 0..demod.len() {
-            let hc = if i < overlap { hb[i] } else { f64::from(ha[i]) };
-            let hf = config.gain * hc;
-            result.push((config.sharpness_level * hf + f64::from(demod[i])) as f32);
-        }
-        result
-    }
-}
-
 // Mutable ChromaAFC carrier-tracking state; immutable filters and constants live
 // in DecoderSpec.
 
@@ -817,16 +698,15 @@ struct ChromaAfcState {
 }
 
 fn chroma_afc_chainfiltfilt(config: &DecoderSpec, data: &[f32]) -> Vec<f32> {
-    // The chroma buffer is stored as f32; keep the narrowband filtfilt chain's
-    // field-sized output in f32 as well (each filtfilt still runs its recurrence
-    // in f64 internally). This only feeds the cafc center-frequency measurement.
+    // The narrowband SOS chain keeps its field-sized output in f32. This only
+    // feeds the cafc center-frequency measurement.
     let mut iter = config.chroma_afc_narrowband.iter();
-    let Some((b0, a0)) = iter.next() else {
+    let Some(sos0) = iter.next() else {
         return data.to_vec();
     };
-    let mut filtered = filtfilt_f32(b0, a0, data);
-    for (b, a) in iter {
-        filtered = filtfilt_f32(b, a, &filtered);
+    let mut filtered = sosfiltfilt_f32(sos0, data);
+    for sos in iter {
+        filtered = sosfiltfilt_f32(sos, &filtered);
     }
     filtered
 }
@@ -902,19 +782,20 @@ impl ChromaAfcState {
     }
 
     // Filter to pick out color-under chroma component (about twice the carrier).
-    // Note: order will be doubled since we use filtfilt.
-    fn get_chroma_bandpass(&self, config: &DecoderSpec) -> Result<Vec<Sos<f64>>> {
+    // Note: the effective order doubles since it is applied forward and backward.
+    fn get_chroma_bandpass(&self, config: &DecoderSpec) -> Result<Vec<Sos<f32>>> {
         let freq_hz_half = config.freq_hz() / 2.0;
         let chroma_bpf_under_ratio =
             config.decoder_chroma_bpf_upper / config.decoder_color_under_carrier;
-        butter_sos(
+        let sos = butter_sos(
             config.decoder_chroma_bpf_order,
             &[
                 config.decoder_chroma_bpf_lower / freq_hz_half,
                 self.cc_freq_mhz * 1e6 * chroma_bpf_under_ratio / freq_hz_half,
             ],
             FilterBandType::Bandpass,
-        )
+        )?;
+        Ok(narrow_sos(&sos))
     }
 }
 
@@ -1074,23 +955,21 @@ struct MetadataFieldState {
 fn demod_chroma_filt_array(
     data: &[f32],
     spec: &DecoderSpec,
-    filter: &[Sos<f64>],
+    filter: &[Sos<f32>],
     blocklen: usize,
     move_by: Option<isize>,
 ) -> ChromaArray {
     let end = data.len().min(blocklen);
-    // The filters are generic over the input element type and convert to f64 per
-    // sample internally, so feed the input slice directly (no block-sized f64
-    // copy). The chroma is stored as f32 throughout this block-sized buffer (the
-    // recurrences still run in f64); the downstream chroma pipeline is already
-    // f32 and the AFC center-frequency measurement widens back per sample.
+    // The chroma is f32 throughout this block-sized buffer; feed the input slice
+    // straight to the SOS filters and keep the output f32 for the downstream
+    // chroma pipeline.
     let mut out_chroma = sosfiltfilt_f32(filter, &data[..end]);
-    if let Some((b, a)) = spec.chroma_filter_audio_notch.as_ref() {
-        out_chroma = filtfilt_f32(b, a, &out_chroma);
+    if let Some(sos) = spec.chroma_filter_audio_notch.as_ref() {
+        out_chroma = sosfiltfilt_f32(sos, &out_chroma);
     }
     // f_video_notch is populated exactly when the user passed --notch.
-    if let Some((b, a)) = spec.chroma_filter_video_notch.as_ref() {
-        out_chroma = filtfilt_f32(b, a, &out_chroma);
+    if let Some(sos) = spec.chroma_filter_video_notch.as_ref() {
+        out_chroma = sosfiltfilt_f32(sos, &out_chroma);
     }
     shift_chroma_and_remove_dc(out_chroma, move_by.unwrap_or_else(|| spec.chroma_offset()))
 }
@@ -1146,22 +1025,85 @@ fn cubic_resample(data: &[f32], input_rate: usize, output_rate: usize) -> Vec<f3
     }
     let out_len = ((data.len() as u128 * output_rate as u128) / input_rate as u128) as usize;
     let scale = input_rate as f64 / output_rate as f64;
+
+    // Output `i = q*output_rate + p` samples position `i*scale = q*input_rate +
+    // p*scale`, so the integer tap base advances by `input_rate` every
+    // `output_rate` outputs and the fractional offset depends only on the phase
+    // `p`. The four Catmull-Rom tap weights are a function of that offset alone,
+    // so precompute one weight set (and integer tap offset) per phase and reduce
+    // the per-output work to a table lookup and four multiply-adds, instead of
+    // re-deriving the cubic (and an f64 floor) for every sample.
+    let phases: Vec<(usize, [f32; 4])> = (0..output_rate)
+        .map(|p| {
+            let pos = p as f64 * scale;
+            let idx_off = pos.floor();
+            let f = (pos - idx_off) as f32;
+            let f2 = f * f;
+            let f3 = f2 * f;
+            let weights = [
+                -0.5 * f3 + f2 - 0.5 * f,
+                1.5 * f3 - 2.5 * f2 + 1.0,
+                -1.5 * f3 + 2.0 * f2 + 0.5 * f,
+                0.5 * f3 - 0.5 * f2,
+            ];
+            (idx_off as usize, weights)
+        })
+        .collect();
+
+    // Tap index of output `i`; nondecreasing in `i`, so the outputs whose
+    // 4-tap window leaves the input form a head and a tail around an interior
+    // that needs no clamping.
+    let idx_at = |i: usize| -> isize {
+        (i / output_rate * input_rate) as isize + phases[i % output_rate].0 as isize
+    };
+    let clamped_at = |i: usize| -> f32 {
+        let (_, w) = &phases[i % output_rate];
+        let idx = idx_at(i);
+        let p0 = sample_clamped(data, idx - 1);
+        let p1 = sample_clamped(data, idx);
+        let p2 = sample_clamped(data, idx + 1);
+        let p3 = sample_clamped(data, idx + 2);
+        w[0] * p0 + w[1] * p1 + w[2] * p2 + w[3] * p3
+    };
+    let head_end = (0..out_len).find(|&i| idx_at(i) >= 1).unwrap_or(out_len);
+    let in_window = |i: usize| idx_at(i) + 2 < data.len() as isize;
+    // Binary search for the first output past the in-bounds interior.
+    let tail_start = {
+        let (mut lo, mut hi) = (head_end, out_len);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if in_window(mid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+
     let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let pos = i as f64 * scale;
-        let idx = pos.floor() as isize;
-        let frac = pos - idx as f64;
-        // The resampled chroma-trap buffer is stored as f32; the cubic
-        // interpolation still evaluates in f64 and rounds to f32 once.
-        let p0 = f64::from(sample_clamped(data, idx - 1));
-        let p1 = f64::from(sample_clamped(data, idx));
-        let p2 = f64::from(sample_clamped(data, idx + 1));
-        let p3 = f64::from(sample_clamped(data, idx + 2));
-        let a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
-        let a1 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
-        let a2 = -0.5 * p0 + 0.5 * p2;
-        out.push((((a0 * frac + a1) * frac + a2) * frac + p1) as f32);
+    out.extend((0..head_end).map(clamped_at));
+    // The interior walks whole phase cycles: a single slice index per output
+    // replaces the four per-tap clamps, and the inner loop carries no phase
+    // wrap check.
+    let mut i = head_end;
+    let mut phase = head_end % output_rate;
+    let mut base = head_end / output_rate * input_rate;
+    while i < tail_start {
+        let run = (tail_start - i).min(output_rate - phase);
+        for (idx_off, w) in &phases[phase..phase + run] {
+            let s = base + idx_off;
+            let window = &data[s - 1..s + 3];
+            out.push(w[0] * window[0] + w[1] * window[1] + w[2] * window[2] + w[3] * window[3]);
+        }
+        i += run;
+        phase += run;
+        if phase == output_rate {
+            phase = 0;
+            base += input_rate;
+        }
     }
+    out.extend((tail_start..out_len).map(clamped_at));
     out
 }
 
@@ -1243,7 +1185,6 @@ pub struct Decoder {
     fdoffset: f64,
     inter_field_state: InterFieldState,
     resync_state: ResyncState,
-    video_eq_state: Option<VideoEqState>,
     chroma_afc_state: ChromaAfcState,
     fields: Vec<FieldInfoEntry>,
     seen_first_field: bool,
@@ -1258,14 +1199,12 @@ impl Decoder {
     pub fn new(spec: Arc<DecoderSpec>, fdoffset: f64) -> Self {
         let inter_field_state = InterFieldState::new(spec.track_phase);
         let resync_state = ResyncState::new(&spec);
-        let video_eq_state = spec.video_eq_config.as_ref().map(VideoEqState::new);
         let chroma_afc_state = ChromaAfcState::new(&spec);
         Self {
             spec,
             fdoffset,
             inter_field_state,
             resync_state,
-            video_eq_state,
             chroma_afc_state,
             fields: Vec::new(),
             seen_first_field: false,
@@ -1370,12 +1309,7 @@ impl Decoder {
                         completed_blocks = false;
                         break;
                     };
-                    decode_video_block(
-                        rawdata,
-                        &self.spec,
-                        self.video_eq_state.as_mut(),
-                        &mut video,
-                    )?;
+                    decode_video_block(rawdata, &self.spec, &mut video)?;
                 }
                 self.pending_result = if completed_blocks {
                     let rawdecode = FieldData {
@@ -1527,9 +1461,9 @@ impl Decoder {
                     let distance_from_previous_field = disk_loc - prevfi.disk_loc;
                     if prevfi.detected_first_field == detected_first_field
                         && prevfi_2
-                        .as_ref()
-                        .is_some_and(|prev| prev.detected_first_field)
-                        == prevfi.detected_first_field
+                            .as_ref()
+                            .is_some_and(|prev| prev.detected_first_field)
+                            == prevfi.detected_first_field
                         && inrange(distance_from_previous_field, 0.9, 1.1)
                     {
                         // treat this as progressive, and manually flip the field order.

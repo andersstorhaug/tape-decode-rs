@@ -346,7 +346,6 @@ fn parse_frequency(value: &str) -> Result<f64> {
     Ok(base * multiplier)
 }
 
-
 pub fn run_cli() -> Result<()> {
     match Cli::parse().command {
         Command::Decode(args) => run_decode(args),
@@ -503,7 +502,6 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
     }
     Ok(())
 }
-
 
 fn run_write_profile(args: WriteProfileArgs) -> Result<()> {
     let profile = flatten_profile(args.profile.as_deref(), args.profile_file.as_deref())?;
@@ -662,7 +660,6 @@ fn compare_tbc(
     }
     Ok(())
 }
-
 
 fn read_tbc_json(path: &Path) -> Result<TbcMetadataFull> {
     let data = std::fs::read_to_string(path)

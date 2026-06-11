@@ -1,13 +1,14 @@
 use anyhow::{bail, Context as _, Result};
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rustfft::num_complex::{Complex32, Complex64};
 use rustfft::{Fft, FftPlanner};
 use sci_rs::signal::filter::design::{FilterBandType, Sos};
 use std::sync::Arc;
 
 use crate::decode::{
-    butter_sos, gen_chroma_heterodyne, lfilter_zi, ChromaSepClass, BLOCKCUT, BLOCKCUT_END,
-    BLOCKSIZE,
+    butter_sos, gen_chroma_heterodyne, ChromaSepClass, BLOCKCUT, BLOCKCUT_END, BLOCKSIZE,
 };
+use crate::optimized::narrow_sos;
 use crate::request::{
     BoostRampFilter, ColorSystem, DecodeRequest, DeemphasisParams, FieldOrderAction, LineSystem,
     NonlinearParams, ShelfKind, VideoLumaFilter, WowInterpolation,
@@ -26,18 +27,9 @@ fn store_complex_filter(values: Vec<Complex64>) -> Vec<Complex32> {
     })
 }
 
-// Sharpness control based on format parameters and sharpness setting.
-//
-// The immutable filter coefficients/gains live in VideoEqConfig; the mutable
-// IIR delay state that carries across blocks/fields lives in VideoEqState.
-
-pub(crate) struct VideoEqConfig {
-    pub(crate) b: Vec<f64>,
-    pub(crate) a: Vec<f64>,
-    pub(crate) gain: f64,
-    pub(crate) sharpness_level: f64,
-    pub(crate) initial_z: Vec<f64>,
-    _private: (),
+// Narrow a designed SOS cascade to f32 for the native-f32 filter runtime.
+fn store_sos_filter(sos: Vec<Sos<f64>>) -> Vec<Sos<f32>> {
+    narrow_sos(&sos)
 }
 
 pub struct DecoderSpec {
@@ -83,9 +75,13 @@ pub struct DecoderSpec {
     pub(crate) decoder_nonlinear_static_factor: Option<f32>,
 
     pub(crate) field_order_action: FieldOrderAction,
-    pub(crate) video_eq_config: Option<VideoEqConfig>,
+    // Sharpness EQ: the zero-phase highpass added back onto the demod has the
+    // purely real transfer |H|^2, so the whole effect is one spectrum gain
+    // (1 + sharpness*gain*|H|^2) over the unique block bins, applied with the
+    // r2c/c2r block transforms instead of a high-order time-domain cascade.
+    pub(crate) video_eq_fft_gain: Option<Vec<f32>>,
 
-    pub(crate) chroma_afc_narrowband: Vec<(Vec<f64>, Vec<f64>)>,
+    pub(crate) chroma_afc_narrowband: Vec<Vec<Sos<f32>>>,
     pub(crate) chroma_afc_fine_tune_fh_ratio: f64,
 
     pub(crate) dod_threshold_p: f32,
@@ -111,37 +107,37 @@ pub struct DecoderSpec {
     pub(crate) rf_disable_burst_hsync: bool,
     pub(crate) rf_disable_phase_correction: bool,
 
-    pub(crate) chroma_filter_video_burst: Vec<Sos<f64>>,
-    pub(crate) chroma_filter_video_notch: Option<(Vec<f64>, Vec<f64>)>,
-    pub(crate) chroma_filter_deemphasis: Option<(Vec<f64>, Vec<f64>)>,
-    pub(crate) chroma_filter_audio_notch: Option<(Vec<f64>, Vec<f64>)>,
-    pub(crate) chroma_filter_final: Vec<Sos<f64>>,
+    pub(crate) chroma_burst_block_fft_gain: Vec<f32>,
+    pub(crate) chroma_filter_video_notch: Option<Vec<Sos<f32>>>,
+    pub(crate) chroma_filter_deemphasis: Option<Vec<Sos<f32>>>,
+    pub(crate) chroma_filter_audio_notch: Option<Vec<Sos<f32>>>,
+    pub(crate) chroma_filter_final: Vec<Sos<f32>>,
 
     pub(crate) video_rf_filter: Vec<f32>,
     pub(crate) video_notch_filter: Option<Vec<f32>>,
-    pub(crate) video_hilbert_filter: Vec<f32>,
-    pub(crate) video_env_post_filter: Vec<Sos<f64>>,
-    pub(crate) video_rf_top_filter: Option<Vec<Sos<f64>>>,
-    pub(crate) video_high_boost_value: Option<f64>,
+    pub(crate) video_env_post_filter: Vec<Sos<f32>>,
+    pub(crate) video_rf_top_fft_gain: Option<Vec<f32>>,
+    pub(crate) video_high_boost_value: Option<f32>,
     pub(crate) video_disable_diff_demod: bool,
     pub(crate) video_chroma_trap: Option<ChromaSepClass>,
     pub(crate) video_filter: Vec<Complex32>,
-    pub(crate) video_nl_amplitude_lpf: Vec<Sos<f64>>,
+    pub(crate) video_nl_amplitude_lpf: Vec<Sos<f32>>,
     pub(crate) video_nl_high_pass_f: Option<Vec<Complex32>>,
     pub(crate) video_nldeemp_enabled: bool,
     pub(crate) video_subdeemp_enabled: bool,
-    pub(crate) video_fsc_notch: Option<(Vec<f64>, Vec<f64>)>,
+    pub(crate) video_fsc_notch: Option<Vec<Sos<f32>>>,
     pub(crate) video05_filter: Vec<Complex32>,
 
-    pub(crate) fft_block_forward_f32: Arc<dyn Fft<f32>>,
     pub(crate) fft_block_inverse_f32: Arc<dyn Fft<f32>>,
+    pub(crate) fft_block_r2c_f32: Arc<dyn RealToComplex<f32>>,
+    pub(crate) fft_block_c2r_f32: Arc<dyn ComplexToReal<f32>>,
     pub(crate) fft_field_forward_f32: Arc<dyn Fft<f32>>,
     pub(crate) fft_field_inverse_f32: Arc<dyn Fft<f32>>,
 
     pub(crate) resync_divisor: usize,
-    pub(crate) resync_vsync_env_filter: (Vec<f64>, Vec<f64>),
-    pub(crate) resync_serration_filter_base: [(Vec<f64>, Vec<f64>); 2],
-    pub(crate) resync_serration_filter_envelope: (Vec<f64>, Vec<f64>),
+    pub(crate) resync_vsync_env_filter: Vec<Sos<f64>>,
+    pub(crate) resync_serration_filter_base: [Vec<Sos<f64>>; 2],
+    pub(crate) resync_serration_filter_envelope: Vec<Sos<f64>>,
 
     pub(crate) ntscj: bool,
     pub(crate) track_phase: Option<i64>,
@@ -187,27 +183,26 @@ impl DecoderSpec {
         };
         // Controls the sharpness EQ gain.
         let sharpness_level = request.sharpness as f64 / 100.0;
-        let video_eq_config = if sharpness_level > f64::EPSILON {
+        let video_eq_fft_gain = if sharpness_level > f64::EPSILON {
             let loband = &decoder_params
                 .video_eq
                 .as_ref()
                 .context("sharpness requires video_eq params")?
                 .loband;
-            let (b, a) = iir_highpass(
+            let sos = iir_highpass_sos(
                 freq_hz,
                 loband.corner,
                 loband.transition,
                 loband.order_limit,
             )?;
-            let initial_z = lfilter_zi(&b, &a);
-            Some(VideoEqConfig {
-                b,
-                a,
-                gain: loband.order_limit as f64,
-                sharpness_level,
-                initial_z,
-                _private: (),
-            })
+            let gain = loband.order_limit as f64;
+            let response = sosfiltfft(&sos, BLOCKSIZE);
+            Some(
+                response[..BLOCKSIZE / 2 + 1]
+                    .iter()
+                    .map(|h| (sharpness_level * gain).mul_add(h.norm_sqr(), 1.0) as f32)
+                    .collect(),
+            )
         } else {
             None
         };
@@ -230,8 +225,8 @@ impl DecoderSpec {
             let trans = color_under * TRANSITION_EXPAND * percent / 100.0;
             let samp_rate = out_sample_rate_mhz * 1e6;
             vec![
-                iir_highpass(samp_rate, color_under, trans, 200)?,
-                iir_lowpass(samp_rate, color_under, trans, 200)?,
+                store_sos_filter(iir_highpass_sos(samp_rate, color_under, trans, 200)?),
+                store_sos_filter(iir_lowpass_sos(samp_rate, color_under, trans, 200)?),
             ]
         } else {
             Vec::new()
@@ -239,10 +234,15 @@ impl DecoderSpec {
 
         let blocklen = BLOCKSIZE;
         let mut fft_planner_f32 = FftPlanner::<f32>::new();
-        let fft_block_forward_f32 = fft_planner_f32.plan_fft_forward(blocklen);
         let fft_block_inverse_f32 = fft_planner_f32.plan_fft_inverse(blocklen);
         let fft_field_forward_f32 = fft_planner_f32.plan_fft_forward(fieldlen);
         let fft_field_inverse_f32 = fft_planner_f32.plan_fft_inverse(fieldlen);
+        // Half-spectrum transforms for the real-valued block signals: the
+        // forward r2c produces only the blocklen/2 + 1 unique bins and the c2r
+        // inverse consumes the same, so each runs on a half-length inner FFT.
+        let mut fft_real_planner = RealFftPlanner::<f32>::new();
+        let fft_block_r2c_f32 = fft_real_planner.plan_fft_forward(blocklen);
+        let fft_block_c2r_f32 = fft_real_planner.plan_fft_inverse(blocklen);
 
         let is_color_under = rf_color_system != ColorSystem::Monochrome;
 
@@ -255,8 +255,6 @@ impl DecoderSpec {
         let rf_disable_comb = request.disable_comb || rf_color_system == ColorSystem::Secam;
         let rf_fallback_vsync = request.fallback_vsync;
         let rf_y_comb = request.y_comb * sys_params.hz_ire;
-
-        let video_hilbert_filter = build_hilbert(blocklen);
 
         // Filter for rf before demodulating.
         // Only use bpf if video_bpf is defined - otherwise skip.
@@ -339,12 +337,23 @@ impl DecoderSpec {
             video_rf_filter = multiply(&video_rf_filter, &ramp);
         }
 
-        let video_rf_top_filter = if let Some(boost_bpf) = &decoder_params.boost_bpf {
-            Some(butter_sos(
+        // The high-boost band extraction is zero-phase, so it reduces to the
+        // real |H|^2 spectrum gain over the unique block bins, applied straight
+        // to the already-available RF spectrum instead of round-tripping
+        // through a time-domain forward/backward cascade.
+        let video_rf_top_fft_gain = if let Some(boost_bpf) = &decoder_params.boost_bpf {
+            let sos = butter_sos(
                 1,
                 &[boost_bpf.low / freq_hz_half, boost_bpf.high / freq_hz_half],
                 FilterBandType::Bandpass,
-            )?)
+            )?;
+            let response = sosfiltfft(&sos, BLOCKSIZE);
+            Some(
+                response[..BLOCKSIZE / 2 + 1]
+                    .iter()
+                    .map(|h| h.norm_sqr() as f32)
+                    .collect::<Vec<f32>>(),
+            )
         } else {
             None
         };
@@ -398,7 +407,7 @@ impl DecoderSpec {
             FilterBandType::Lowpass,
         )?;
         let video_fsc_notch = if decode_options.use_fsc_notch_filter {
-            Some(ba_to_vec(iirnotch(sys_params.fsc_mhz / freq_half, 2.0)?))
+            Some(biquad_sos(iirnotch(sys_params.fsc_mhz / freq_half, 2.0)?))
         } else {
             None
         };
@@ -414,7 +423,7 @@ impl DecoderSpec {
         let video_high_boost_value = decoder_params
             .boost_bpf
             .as_ref()
-            .map(|boost_bpf| request.high_boost.unwrap_or(boost_bpf.mult));
+            .map(|boost_bpf| request.high_boost.unwrap_or(boost_bpf.mult) as f32);
 
         let chroma_bandpass_final = |color_under_format: bool| -> Result<Vec<Sos<f64>>> {
             let (lower, upper) = if color_under_format {
@@ -436,7 +445,8 @@ impl DecoderSpec {
 
         // --- Build luma notch filter for the RF/video path ---
         let (video_notch_filter, chroma_filter_video_notch) = if let Some(notch) = &request.notch {
-            let video_notch_ba = ba_to_vec(iirnotch(notch.freq / freq_half, notch.q)?);
+            let video_notch_raw = iirnotch(notch.freq / freq_half, notch.q)?;
+            let video_notch_ba = ba_to_vec(video_notch_raw);
             let video_notch_filter = abs_complex_owned(filtfft(
                 &video_notch_ba.0,
                 &video_notch_ba.1,
@@ -444,12 +454,12 @@ impl DecoderSpec {
                 true,
             ));
             let chroma_filter_video_notch = if do_cafc {
-                ba_to_vec(iirnotch(
+                biquad_sos(iirnotch(
                     notch.freq / chroma_afc_out_frequency_half,
                     notch.q,
                 )?)
             } else {
-                video_notch_ba
+                biquad_sos(video_notch_raw)
             };
             (Some(video_notch_filter), Some(chroma_filter_video_notch))
         } else {
@@ -470,12 +480,12 @@ impl DecoderSpec {
             chroma_bandpass_final(false)?
         };
         let chroma_filter_deemphasis = if chroma_deemphasis_enabled {
-            Some(peaking(
+            Some(biquad_sos_vec(peaking(
                 sys_params.fsc_mhz / chroma_afc_out_frequency_half,
                 3.4,
                 None,
                 Some(0.5 / chroma_afc_out_frequency_half),
-            )?)
+            )?))
         } else {
             None
         };
@@ -487,13 +497,34 @@ impl DecoderSpec {
                 freq_hz_half
             };
 
-            Some(ba_to_vec(iirnotch(
+            Some(biquad_sos(iirnotch(
                 decoder_params.chroma_audio_notch_freq / nyquist,
                 CHROMA_AUDIO_NOTCH_Q,
             )?))
         } else {
             None
         };
+        // Combined zero-phase response of the block-level chroma burst chain
+        // (the burst bandpass plus the optional audio/video notches): each
+        // filtfilt transfer is the purely real |H|^2, so the whole chain
+        // collapses into one spectrum gain over the unique block bins.
+        let chroma_burst_block_fft_gain = {
+            let mut gain: Vec<f64> = sosfiltfft(&chroma_filter_video_burst, blocklen)
+                [..blocklen / 2 + 1]
+                .iter()
+                .map(|h| h.norm_sqr())
+                .collect();
+            for sos in [&chroma_filter_audio_notch, &chroma_filter_video_notch]
+                .into_iter()
+                .flatten()
+            {
+                for (bin, h) in gain.iter_mut().zip(sosfiltfft(sos, blocklen)) {
+                    *bin *= h.norm_sqr();
+                }
+            }
+            convert_vec_in_place(gain, |bin| bin as f32)
+        };
+
         // Post-TBC chroma filter at output sample rate (4fsc).
         let chroma_filter_final = chroma_bandpass_final(is_color_under)?;
         let (rf_chroma_heterodyne, rf_fsc_wave) = if is_color_under {
@@ -522,13 +553,13 @@ impl DecoderSpec {
         let fh = sys_params.fps * sys_params.frame_lines.line_count() as f64;
         let venv_limit = 5.0;
         let serration_limit = 3.0;
-        let resync_vsync_env_filter = iir_lowpass(samp_rate, fv * venv_limit, 1e3, 20)?;
+        let resync_vsync_env_filter = iir_lowpass_sos(samp_rate, fv * venv_limit, 1e3, 20)?;
         let resync_serration_filter_base = [
-            iir_highpass(samp_rate, fh, fh, 20)?,
-            iir_lowpass(samp_rate, fh, fh, 20)?,
+            iir_highpass_sos(samp_rate, fh, fh, 20)?,
+            iir_lowpass_sos(samp_rate, fh, fh, 20)?,
         ];
         let resync_serration_filter_envelope =
-            iir_lowpass(samp_rate, fh / serration_limit, fh / 2.0, 20)?;
+            iir_lowpass_sos(samp_rate, fh / serration_limit, fh / 2.0, 20)?;
 
         let track_phase = request.track_phase;
         if let Some(track_phase) = track_phase {
@@ -546,7 +577,7 @@ impl DecoderSpec {
 
         Ok(Self {
             field_order_action: request.field_order_action,
-            video_eq_config,
+            video_eq_fft_gain,
 
             chroma_afc_narrowband,
             chroma_afc_fine_tune_fh_ratio: decode_options.chroma_afc_fine_tune_fh_ratio,
@@ -616,30 +647,30 @@ impl DecoderSpec {
             rf_disable_burst_hsync: request.rf_disable_burst_hsync,
             rf_disable_phase_correction: request.rf_disable_phase_correction,
 
-            chroma_filter_video_burst,
-            chroma_filter_video_notch,
-            chroma_filter_deemphasis,
-            chroma_filter_audio_notch,
-            chroma_filter_final,
+            chroma_burst_block_fft_gain,
+            chroma_filter_video_notch: chroma_filter_video_notch.map(store_sos_filter),
+            chroma_filter_deemphasis: chroma_filter_deemphasis.map(store_sos_filter),
+            chroma_filter_audio_notch: chroma_filter_audio_notch.map(store_sos_filter),
+            chroma_filter_final: store_sos_filter(chroma_filter_final),
 
             video_rf_filter: store_real_filter(video_rf_filter),
             video_notch_filter: video_notch_filter.map(store_real_filter),
-            video_hilbert_filter,
-            video_env_post_filter,
-            video_rf_top_filter,
+            video_env_post_filter: store_sos_filter(video_env_post_filter),
+            video_rf_top_fft_gain,
             video_high_boost_value,
             video_disable_diff_demod: request.video_disable_diff_demod,
             video_chroma_trap,
             video_filter: store_complex_filter(video_filter),
-            video_nl_amplitude_lpf,
+            video_nl_amplitude_lpf: store_sos_filter(video_nl_amplitude_lpf),
             video_nl_high_pass_f: video_nl_high_pass_f.map(store_complex_filter),
             video_nldeemp_enabled: request.video_nldeemp_enabled,
             video_subdeemp_enabled,
-            video_fsc_notch,
+            video_fsc_notch: video_fsc_notch.map(store_sos_filter),
             video05_filter: store_complex_filter(video05_filter),
 
-            fft_block_forward_f32,
             fft_block_inverse_f32,
+            fft_block_r2c_f32,
+            fft_block_c2r_f32,
             fft_field_forward_f32,
             fft_field_inverse_f32,
 
@@ -830,20 +861,6 @@ impl DecoderSpec {
 
 fn t_to_samples(samp_rate: f64, time: f64) -> f64 {
     samp_rate / (1.0 / time)
-}
-
-fn build_hilbert(fft_size: usize) -> Vec<f32> {
-    assert_ne!(fft_size, 0);
-    assert!(fft_size.is_multiple_of(2));
-
-    let mut output = vec![0.0f32; fft_size];
-    let half_size = fft_size / 2;
-    output[0] = 1.0;
-    output[half_size] = 1.0;
-    for sample in &mut output[1..half_size] {
-        *sample = 2.0;
-    }
-    output
 }
 
 fn gen_wave_at_frequency(
@@ -1203,35 +1220,39 @@ fn design_filter(
     Ok((order, normal_cutoff))
 }
 
-fn iir_lowpass(
+/// Butterworth lowpass designed directly as second-order sections. `butter_sos`
+/// takes no `fs`, and `butter_dyn` rescales `wn` by `2/fs` when one is supplied
+/// (see sci-rs `iirfilter`), so pre-normalizing the cutoff to half-cycles/sample
+/// and passing no `fs` yields the identical filter.
+fn iir_lowpass_sos(
     samp_rate: f64,
     cutoff: f64,
     transition_width: f64,
     order_limit: usize,
-) -> Result<(Vec<f64>, Vec<f64>)> {
+) -> Result<Vec<Sos<f64>>> {
     let stopband = cutoff + transition_width;
     let (order, normal_cutoff) = design_filter(samp_rate, cutoff, stopband, order_limit)?;
-    butter_ba(
+    butter_sos(
         order,
-        &[normal_cutoff],
+        &[2.0 * normal_cutoff / samp_rate],
         FilterBandType::Lowpass,
-        Some(samp_rate),
     )
 }
 
-fn iir_highpass(
+/// Butterworth highpass designed directly as second-order sections; see
+/// [`iir_lowpass_sos`].
+fn iir_highpass_sos(
     samp_rate: f64,
     cutoff: f64,
     transition_width: f64,
     order_limit: usize,
-) -> Result<(Vec<f64>, Vec<f64>)> {
+) -> Result<Vec<Sos<f64>>> {
     let stopband = cutoff + transition_width;
     let (order, normal_cutoff) = design_filter(samp_rate, cutoff, stopband, order_limit)?;
-    butter_ba(
+    butter_sos(
         order,
-        &[normal_cutoff],
+        &[2.0 * normal_cutoff / samp_rate],
         FilterBandType::Highpass,
-        Some(samp_rate),
     )
 }
 
@@ -1360,6 +1381,21 @@ fn filtfft(b: &[f64], a: &[f64], block_len: usize, whole: bool) -> Vec<Complex64
 
 fn ba_to_vec(pair: ([f64; 3], [f64; 3])) -> (Vec<f64>, Vec<f64>) {
     (pair.0.to_vec(), pair.1.to_vec())
+}
+
+/// Wrap a single biquad (3-tap BA) as a one-section SOS cascade, so it runs
+/// through the shared `sosfiltfilt`/`sosfilt` path like the other filters.
+fn biquad_sos(pair: ([f64; 3], [f64; 3])) -> Vec<Sos<f64>> {
+    vec![Sos::new(pair.0, pair.1)]
+}
+
+/// Wrap a single biquad given as length-3 BA coefficient vectors (e.g. the
+/// `peaking`/`bilinear` designers) as a one-section SOS cascade.
+fn biquad_sos_vec(ba: (Vec<f64>, Vec<f64>)) -> Vec<Sos<f64>> {
+    let (b, a) = ba;
+    debug_assert_eq!(b.len(), 3);
+    debug_assert_eq!(a.len(), 3);
+    vec![Sos::new([b[0], b[1], b[2]], [a[0], a[1], a[2]])]
 }
 
 fn abs_complex_owned(values: Vec<Complex64>) -> Vec<f64> {

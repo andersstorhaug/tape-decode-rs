@@ -1,5 +1,5 @@
-use super::*;
 use super::sync::try_get_pulses;
+use super::*;
 
 fn demod_burst(
     burst: &[f32],
@@ -16,27 +16,28 @@ fn demod_burst(
         bail!("burst window exceeds reference waveform length");
     }
 
-    let mut i = 0.0;
-    let mut q = 0.0;
+    let mut i = 0.0f32;
+    let mut q = 0.0f32;
     for (index, &sample) in burst.iter().take(burst_len).enumerate() {
         let phase_index = index + burst_start;
         let (sin, cos) = burst_wave[phase_index];
-        let sample = f64::from(sample);
-        i += sample * f64::from(cos);
-        q += sample * f64::from(sin);
+        i += sample * cos;
+        q += sample * sin;
     }
 
+    let i = f64::from(i);
+    let q = f64::from(q);
     let burst_magnitude = i.hypot(q);
     let burst_phase_deg = q.atan2(i).to_degrees().rem_euclid(360.0);
     Ok((burst_phase_deg, burst_magnitude, i, q))
 }
 
-fn nb_absmax(values: &[f64]) -> f64 {
+fn nb_absmax(values: &[f32]) -> f32 {
     let mut max_value = 0.0;
     for &value in values {
         let abs_value = value.abs();
         if abs_value.is_nan() {
-            return f64::NAN;
+            return f32::NAN;
         }
         if abs_value > max_value {
             max_value = abs_value;
@@ -67,8 +68,9 @@ fn calczc_do(
         bail!("start_offset out of range");
     }
 
+    let target_f = target as f32;
     if edge == 0 {
-        edge = if f64::from(data[start_offset_index]) < target {
+        edge = if data[start_offset_index] < target_f {
             1
         } else {
             -1
@@ -77,8 +79,8 @@ fn calczc_do(
 
     let edge_index =
         resolve_signed_index(data.len(), start_offset).context("start_offset out of range")?;
-    let edge_value = f64::from(data[edge_index]);
-    if (edge == 1 && edge_value > target) || (edge == -1 && edge_value < target) {
+    let edge_value = data[edge_index];
+    if (edge == 1 && edge_value > target_f) || (edge == -1 && edge_value < target_f) {
         return Ok(f64::NAN);
     }
 
@@ -92,20 +94,17 @@ fn calczc_do(
     };
     let Some(loc) = data[start_offset_index..search_end]
         .iter()
-        .position(|&sample| {
-            let sample = f64::from(sample);
-            (edge == 1 && sample >= target) || (edge != 1 && sample <= target)
-        })
+        .position(|&sample| (edge == 1 && sample >= target_f) || (edge != 1 && sample <= target_f))
     else {
         return Ok(f64::NAN);
     };
 
     let x = start_offset_index + loc;
-    let a = f64::from(data[x - 1]) - target;
-    let b = f64::from(data[x]) - target;
+    let a = data[x - 1] - target_f;
+    let b = data[x] - target_f;
     let y = if b - a != 0.0 { -a / (-a + b) } else { 0.0 };
 
-    Ok(x as f64 - 1.0 + y)
+    Ok(x as f64 - 1.0 + f64::from(y))
 }
 
 fn signed_bounds_slice<T>(data: &[T], start: isize, end: isize) -> &[T] {
@@ -114,15 +113,12 @@ fn signed_bounds_slice<T>(data: &[T], start: isize, end: isize) -> &[T] {
     data.get(start..end).unwrap_or_default()
 }
 
-fn slice_empty_or_out_of_range(values: &[f32], min: f64, max: f64) -> bool {
+fn slice_empty_or_out_of_range(values: &[f32], min: f32, max: f32) -> bool {
     if values.is_empty() {
         return true;
     }
 
-    values.iter().any(|&value| {
-        let value = f64::from(value);
-        value < min || value > max
-    })
+    values.iter().any(|&value| value < min || value > max)
 }
 
 fn round_ties_even_to_isize(value: f64) -> isize {
@@ -145,9 +141,9 @@ fn refine_linelocs_hsync(
     let is_pal = spec.sys_frame_lines != LineSystem::Line525;
     let ire0_hz = f64::from(spec.sys_ire0);
     let hz_ire_f = f64::from(spec.sys_hz_ire);
-    let ire_30 = iretohz(ire0_hz, hz_ire_f, 30.0);
-    let ire_n_65 = iretohz(ire0_hz, hz_ire_f, -65.0);
-    let ire_110 = iretohz(ire0_hz, hz_ire_f, 110.0);
+    let ire_30 = iretohz(ire0_hz, hz_ire_f, 30.0) as f32;
+    let ire_n_65 = iretohz(ire0_hz, hz_ire_f, -65.0) as f32;
+    let ire_110 = iretohz(ire0_hz, hz_ire_f, 110.0) as f32;
 
     let mut linelocs_refined = initial_linelocs.to_vec();
     let mut refined_from_right_lineloc = -1.0;
@@ -343,10 +339,10 @@ fn valid_pulses_to_linelocs(
 }
 
 fn clb_findbursts(
-    burstarea: &[f64],
+    burstarea: &[f32],
     start: usize,
     endburstarea: usize,
-    threshold: f64,
+    threshold: f32,
     bstart: f64,
     s_rem: f64,
     zcburstdiv: f64,
@@ -358,9 +354,9 @@ fn clb_findbursts(
     }
 
     fn clb_calczc_do(
-        data: &[f64],
+        data: &[f32],
         start_offset: usize,
-        target: f64,
+        target: f32,
         edge: i64,
         count: usize,
     ) -> Option<f64> {
@@ -390,7 +386,7 @@ fn clb_findbursts(
         let b = data[x] - target;
         let y = if b - a != 0.0 { -a / (-a + b) } else { 0.0 };
 
-        Some(x as f64 - 1.0 + y)
+        Some(x as f64 - 1.0 + f64::from(y))
     }
 
     let mut zc_count = 0usize;
@@ -437,7 +433,7 @@ fn rotated_phase(current_phase: usize, track_rotation: i64) -> usize {
 fn get_upconverted_burst(
     chroma: &[f32],
     chroma_heterodyne: &[Vec<f32>],
-    chroma_filter: &[Sos<f64>],
+    chroma_filter: &[Sos<f32>],
     current_phase: usize,
     burstarea: (isize, isize),
     burst_wave: &[(f32, f32)],
@@ -689,7 +685,7 @@ fn get_phase_rotation_sequence(
     Ok((chroma_rotation_index, phase_sequence, burst_phase_avg))
 }
 
-fn slice_subtract_mean<T>(data: &[T], start: isize, end: isize) -> Option<Vec<f64>>
+fn slice_subtract_mean<T>(data: &[T], start: isize, end: isize) -> Option<Vec<f32>>
 where
     T: Float,
 {
@@ -697,11 +693,13 @@ where
     if slice.is_empty() {
         return None;
     }
+    // The mean (and the centering subtraction) stay in f64 so the pedestal is
+    // removed exactly; the centered burst signal itself is then carried in f32.
     let mean = mean_slice(slice);
     Some(
         slice
             .iter()
-            .map(|&value| value.to_f64().unwrap() - mean)
+            .map(|&value| (value.to_f64().unwrap() - mean) as f32)
             .collect(),
     )
 }
@@ -986,13 +984,13 @@ pub(crate) fn predecode_field_from_rawdecode(
                                 else {
                                     continue;
                                 };
-                                let threshold = rms(&burstarea);
+                                let threshold = rms(&burstarea) as f32;
                                 let Some(burstarea_demod) =
                                     slice_subtract_mean(demod, s + bstart, s + bend)
                                 else {
                                     continue;
                                 };
-                                if nb_absmax(&burstarea_demod) > 30.0 * f64::from(spec.sys_hz_ire) {
+                                if nb_absmax(&burstarea_demod) > 30.0 * spec.sys_hz_ire {
                                     continue;
                                 }
                                 let zcburstdiv = (lfreq * fsc_mhz_inv) / 2.0;

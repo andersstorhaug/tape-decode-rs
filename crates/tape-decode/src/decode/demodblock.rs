@@ -29,14 +29,14 @@ fn slice_max(values: &[f32]) -> f32 {
 fn replace_spikes(
     demod: &mut [f32],
     demod_diffed: &[f32],
-    max_value: f64,
+    max_value: f32,
     replace_start: usize,
     replace_end: usize,
 ) {
     let to_fix: Vec<usize> = demod
         .iter()
         .enumerate()
-        .filter_map(|(i, &sample)| (f64::from(sample) > max_value).then_some(i))
+        .filter_map(|(i, &sample)| (sample > max_value).then_some(i))
         .collect();
 
     for i in to_fix {
@@ -48,62 +48,67 @@ fn replace_spikes(
     }
 }
 
-fn ifft_complex_real_owned_f32(mut buffer: Vec<Complex32>, inverse_fft: &dyn Fft<f32>) -> Vec<f32> {
-    if buffer.is_empty() {
-        return Vec::new();
-    }
-    // Run the inverse transform without the trailing in-place 1/N scaling pass
-    // and instead fold that scale into the real-part extraction. This collapses
-    // two full passes over the block-sized complex buffer (scale, then map .re)
-    // into a single pass, which matters on the bandwidth-bound MT path where
-    // irfft runs several times per block.
-    let inv_scale = 1.0 / buffer.len() as f32;
-    inverse_fft.process(&mut buffer);
-    convert_vec_in_place(buffer, |sample| sample.re * inv_scale)
-}
-
-fn rfft_f32(input: &[f32], forward_fft: &dyn Fft<f32>) -> Vec<Complex32> {
-    let mut output = fft_real_f32(input, forward_fft);
-    output.truncate((input.len() / 2) + 1);
+/// Forward FFT of a real signal to its `n/2 + 1` unique spectrum bins.
+/// The r2c transform consumes its input as scratch, so the buffer is taken by
+/// value; callers whose signal must survive pass a copy via `rfft_f32`.
+fn rfft_owned_f32(mut buffer: Vec<f32>, r2c: &dyn RealToComplex<f32>) -> Vec<Complex32> {
+    assert_eq!(buffer.len(), r2c.len());
+    let mut output = r2c.make_output_vec();
+    r2c.process(&mut buffer, &mut output)
+        .expect("r2c forward FFT failed");
     output
 }
 
-fn irfft_f32(input: &[Complex32], n: Option<usize>, inverse_fft: &dyn Fft<f32>) -> Vec<f32> {
-    if input.is_empty() {
+fn rfft_f32(input: &[f32], r2c: &dyn RealToComplex<f32>) -> Vec<Complex32> {
+    rfft_owned_f32(input.to_vec(), r2c)
+}
+
+/// See `rfft_owned_f32` for the ownership contract.
+fn irfft_owned_f32(
+    mut spectrum: Vec<Complex32>,
+    n: Option<usize>,
+    c2r: &dyn ComplexToReal<f32>,
+) -> Vec<f32> {
+    if spectrum.is_empty() {
         return Vec::new();
     }
 
-    let n = n.unwrap_or_else(|| 2 * (input.len() - 1));
-    let expected_len = if n.is_multiple_of(2) {
-        (n / 2) + 1
-    } else {
-        n.div_ceil(2)
-    };
-    assert_ne!(n, 0);
-    assert_eq!(input.len(), expected_len);
+    let n = n.unwrap_or_else(|| 2 * (spectrum.len() - 1));
+    assert_eq!(n, c2r.len());
+    assert_eq!(spectrum.len(), (n / 2) + 1);
 
-    let mirror_end = if n.is_multiple_of(2) {
-        input.len() - 1
-    } else {
-        input.len()
-    };
-    // Build the Hermitian-symmetric spectrum sequentially instead of
-    // zero-filling `n` complex slots and overwriting them with a forward copy
-    // plus a backward-scattered mirror. The mirror tail is exactly
-    // input[1..mirror_end] reversed and conjugated, so two sequential extends
-    // write every slot once (total = input.len() + mirror_end - 1 == n) and
-    // skip the wasted memset that showed up as from_elem on the MT path.
+    // The c2r transform rebuilds the signal from the unique bins directly
+    // (half-length inner FFT) instead of mirroring out the full Hermitian
+    // spectrum and running a full-length complex inverse. It rejects residual
+    // imaginary parts on the DC/Nyquist bins, which the filters can leave
+    // behind; the full-spectrum path simply dropped them (only the real part
+    // was kept), so zero them to match.
+    spectrum[0].im = 0.0;
+    spectrum[n / 2].im = 0.0;
+    let mut output = c2r.make_output_vec();
+    c2r.process(&mut spectrum, &mut output)
+        .expect("c2r inverse FFT failed");
+    let inv_scale = 1.0 / n as f32;
+    for sample in &mut output {
+        *sample *= inv_scale;
+    }
+    output
+}
+
+fn irfft_f32(input: &[Complex32], n: Option<usize>, c2r: &dyn ComplexToReal<f32>) -> Vec<f32> {
+    irfft_owned_f32(input.to_vec(), n, c2r)
+}
+
+/// Analytic-signal spectrum from the `n/2 + 1` unique bins: keep DC and
+/// Nyquist, double the interior bins, zero the negative frequencies.
+fn analytic_spectrum(half: &[Complex32], n: usize) -> Vec<Complex32> {
+    assert_eq!(half.len(), (n / 2) + 1);
     let mut spectrum = Vec::with_capacity(n);
-    spectrum.extend_from_slice(input);
-    spectrum.extend(
-        input[1..mirror_end]
-            .iter()
-            .rev()
-            .map(|sample| sample.conj()),
-    );
-    debug_assert_eq!(spectrum.len(), n);
-
-    ifft_complex_real_owned_f32(spectrum, inverse_fft)
+    spectrum.push(half[0]);
+    spectrum.extend(half[1..half.len() - 1].iter().map(|&bin| bin * 2.0));
+    spectrum.push(half[half.len() - 1]);
+    spectrum.resize(n, Complex32::new(0.0, 0.0));
+    spectrum
 }
 
 fn sub_deemphasis(
@@ -122,10 +127,10 @@ fn sub_deemphasis(
     let mut deviation = spec.video_sub_deemphasis_deviation();
 
     let high_pass_fft = spectrum_times_filter(out_video_fft, nl_high_pass_f);
-    let hf_part = irfft_f32(
-        &high_pass_fft,
+    let hf_part = irfft_owned_f32(
+        high_pass_fft,
         Some(out_video.len()),
-        spec.fft_block_inverse_f32.as_ref(),
+        spec.fft_block_c2r_f32.as_ref(),
     );
 
     deviation /= 2.0;
@@ -139,28 +144,33 @@ fn sub_deemphasis(
 
     // Get the instantaneous amplitude of the signal using the hilbert transform
     // and divide by the formats specified deviation so we get a amplitude compared to the specifications references.
-    let analytic = hilbert_f32(
-        &hf_part,
-        spec.fft_block_forward_f32.as_ref(),
-        spec.fft_block_inverse_f32.as_ref(),
-    );
+    let analytic = {
+        let half = rfft_f32(&hf_part, spec.fft_block_r2c_f32.as_ref());
+        let spectrum = analytic_spectrum(&half, hf_part.len());
+        ifft_complex_owned_f32(spectrum, spec.fft_block_inverse_f32.as_ref())
+    };
     // `Complex::norm` calls libm `hypot`, whose overflow-safe scaling is wasted
     // on these bounded analytic samples. Computing the magnitude directly is far
     // cheaper (and matches the `re*re + im*im` idiom used elsewhere).
-    let inv_deviation = 1.0 / f64::from(deviation);
-    // The amplitude buffer is block-sized; store it as f32 (the sosfiltfilt
-    // recurrence still runs in f64 internally) to halve it.
+    let inv_deviation = 1.0 / deviation;
+    // The amplitude buffer is block-sized; the analytic samples are already f32,
+    // so compute each magnitude directly in f32 and store it as f32.
     let mut amplitude: Vec<f32> = analytic
         .iter()
-        .map(|sample| {
-            let re = f64::from(sample.re);
-            let im = f64::from(sample.im);
-            (re.mul_add(re, im * im).sqrt() * inv_deviation) as f32
-        })
+        .map(|sample| sample.re.mul_add(sample.re, sample.im * sample.im).sqrt() * inv_deviation)
         .collect();
 
     // Clip the value after filtering to make sure we don't go negative.
     amplitude = sosfiltfilt_f32(&spec.video_nl_amplitude_lpf, &amplitude);
+    // Hoist the per-spec tuning out of the loop so the body is loop-invariant
+    // arithmetic the compiler can unswitch and vectorize; a multiply by 1.0 is
+    // an exact identity, so the optional scales fold into unconditional muls.
+    let scaling_1 = spec.decoder_nonlinear_scaling_1.unwrap_or(1.0);
+    let exp_scaling = spec.decoder_nonlinear_exp_scaling;
+    let scaling_2 = spec.decoder_nonlinear_scaling_2.unwrap_or(1.0);
+    let logistic = spec
+        .decoder_nonlinear_logistic
+        .filter(|&(_, rate)| rate > 0.0);
     for sample in &mut amplitude {
         // The nonlinear chain runs in f32; its inputs (the analytic amplitude
         // and the amplitude-LPF output) are already f32-precision.
@@ -168,18 +178,12 @@ fn sub_deemphasis(
         if value < 0.0 {
             value = 0.0;
         }
-        if let Some(scale) = spec.decoder_nonlinear_scaling_1 {
-            value *= scale;
-        }
+        value *= scaling_1;
         // Scale the amplitude by a exponential factore (typically less than 1 so it ends up being a root function of sorts)
-        value = value.powf(spec.decoder_nonlinear_exp_scaling);
-        if let Some(scale) = spec.decoder_nonlinear_scaling_2 {
-            value *= scale;
-        }
-        if let Some((mid, rate)) = spec.decoder_nonlinear_logistic {
-            if rate > 0.0 {
-                value *= 1.0 / (1.0 + (-rate * (value - mid)).exp());
-            }
+        value = powf_fast_nonneg(value, exp_scaling);
+        value *= scaling_2;
+        if let Some((mid, rate)) = logistic {
+            value *= 1.0 / (1.0 + exp_fast(-rate * (value - mid)));
         }
         *sample = value;
     }
@@ -202,8 +206,8 @@ fn sub_deemphasis(
 // the real case a complex value with zero imaginary part. `SpectrumValue`
 // spectrum bins reuse the same accessors.
 trait SpectrumFilterSample: Copy {
-    fn re_f64(self) -> f64;
-    fn im_f64(self) -> f64;
+    fn re_f32(self) -> f32;
+    fn im_f32(self) -> f32;
 }
 
 impl<T> SpectrumFilterSample for T
@@ -212,13 +216,13 @@ where
     T::Real: Float,
 {
     #[inline(always)]
-    fn re_f64(self) -> f64 {
-        self.re().to_f64().unwrap()
+    fn re_f32(self) -> f32 {
+        self.re().to_f32().unwrap()
     }
 
     #[inline(always)]
-    fn im_f64(self) -> f64 {
-        self.im().to_f64().unwrap()
+    fn im_f32(self) -> f32 {
+        self.im().to_f32().unwrap()
     }
 }
 
@@ -227,13 +231,13 @@ fn multiply_spectrum_sample<T>(sample: Complex32, filter: T) -> Complex32
 where
     T: SpectrumFilterSample,
 {
-    let sample_re = sample.re_f64();
-    let sample_im = sample.im_f64();
-    let filter_re = filter.re_f64();
-    let filter_im = filter.im_f64();
+    let sample_re = sample.re;
+    let sample_im = sample.im;
+    let filter_re = filter.re_f32();
+    let filter_im = filter.im_f32();
     Complex32::new(
-        sample_re.mul_add(filter_re, -(sample_im * filter_im)) as f32,
-        sample_re.mul_add(filter_im, sample_im * filter_re) as f32,
+        sample_re.mul_add(filter_re, -(sample_im * filter_im)),
+        sample_re.mul_add(filter_im, sample_im * filter_re),
     )
 }
 
@@ -243,11 +247,8 @@ where
 {
     assert_eq!(filter.len(), spectrum.len(), "length mismatch");
     for (sample, &gain) in spectrum.iter_mut().zip(filter) {
-        let gain = gain.to_f64().unwrap();
-        *sample = Complex32::new(
-            (sample.re_f64() * gain) as f32,
-            (sample.im_f64() * gain) as f32,
-        );
+        let gain = gain.to_f32().unwrap();
+        *sample = Complex32::new(sample.re * gain, sample.im * gain);
     }
 }
 
@@ -277,23 +278,20 @@ fn slice_vec<'a, T>(
     &values[blockcut..len - blockcut_end]
 }
 
-fn max_excluding_edges(values: &[f32], edge: usize) -> f64 {
+fn max_excluding_edges(values: &[f32], edge: usize) -> f32 {
     if values.len() <= edge * 2 {
-        return f64::NEG_INFINITY;
+        return f32::NEG_INFINITY;
     }
     values[edge..values.len() - edge]
         .iter()
-        .fold(f64::NEG_INFINITY, |acc, &value| acc.max(f64::from(value)))
+        .fold(f32::NEG_INFINITY, |acc, &value| acc.max(value))
 }
 
 fn ediff1d_complex_to_begin_zero(values: &[Complex32]) -> Vec<Complex32> {
     let mut out = Vec::with_capacity(values.len());
     out.push(Complex32::new(0.0, 0.0));
     for pair in values.windows(2) {
-        out.push(Complex32::new(
-            (pair[1].re_f64() - pair[0].re_f64()) as f32,
-            (pair[1].im_f64() - pair[0].im_f64()) as f32,
-        ));
+        out.push(pair[1] - pair[0]);
     }
     out
 }
@@ -301,7 +299,6 @@ fn ediff1d_complex_to_begin_zero(values: &[Complex32]) -> Vec<Complex32> {
 pub(crate) fn decode_video_block(
     rawdata: &[f32],
     spec: &DecoderSpec,
-    video_eq_state: Option<&mut VideoEqState>,
     out: &mut VideoChannels,
 ) -> Result<()> {
     if rawdata.len() < BLOCKSIZE {
@@ -311,73 +308,66 @@ pub(crate) fn decode_video_block(
             BLOCKSIZE
         );
     }
-    let mut indata_fft = fft_real_f32(&rawdata[..BLOCKSIZE], spec.fft_block_forward_f32.as_ref());
+    // The whole RF conditioning chain works on the unique half spectrum; the
+    // full (Hermitian) spectrum is only spelled out where the analytic signal
+    // needs its one-sided complex inverse.
+    let mut indata_fft = rfft_f32(&rawdata[..BLOCKSIZE], spec.fft_block_r2c_f32.as_ref());
+    let half_bins = indata_fft.len();
 
     if let Some(video_notch_f) = &spec.video_notch_filter {
-        multiply_spectrum_real(&mut indata_fft, video_notch_f);
+        multiply_spectrum_real(&mut indata_fft, &video_notch_f[..half_bins]);
     }
-    multiply_spectrum_real(&mut indata_fft, &spec.video_rf_filter);
+    multiply_spectrum_real(&mut indata_fft, &spec.video_rf_filter[..half_bins]);
 
-    // Analytic signal (the hilbert filter zeroes the negative frequencies).
-    let hilbert_spectrum = spectrum_times_filter(&indata_fft, &spec.video_hilbert_filter);
+    // Analytic signal (zeroed negative frequencies).
+    let hilbert_spectrum = analytic_spectrum(&indata_fft, BLOCKSIZE);
     let mut hilbert = ifft_complex_owned_f32(hilbert_spectrum, spec.fft_block_inverse_f32.as_ref());
 
     // The rectified envelope is |Re(analytic signal)|; derive it from `hilbert`
     // rather than repeating the hilbert-filter multiply and inverse FFT. `c.re`
-    // is f32 and abs() only clears the sign bit, so keeping `raw_env` in f32
-    // (instead of widening to f64 here) is exact — sosfiltfilt widens each
-    // sample back to f64 internally — and halves this block-sized buffer.
+    // is f32 and abs() only clears the sign bit, so keeping `raw_env` in f32 is
+    // exact and halves this block-sized buffer.
     let mut raw_env: Vec<f32> = hilbert.iter().map(|c| c.re.abs()).collect();
     roll(&mut raw_env, 4);
 
-    // `env` is a block-sized buffer that is written to the f32 envelope output
-    // channel and otherwise only feeds the f64 mean below and the high-boost
-    // gain; store it as f32 (the sosfiltfilt recurrence still runs in f64) to
-    // halve this per-block buffer. The mean stays an f64 accumulation.
+    // `env` is a block-sized buffer that feeds the envelope output channel, the
+    // mean below, and the high-boost gain.
     let env = sosfiltfilt_f32(&spec.video_env_post_filter, &raw_env);
-    // Sum and the all-nonzero test in one scan over `env` instead of a `mean`
-    // pass followed by a separate `.all()` pass.
-    let mut env_sum = 0.0;
-    let mut env_all_nonzero = true;
-    for &value in &env {
-        env_sum += f64::from(value);
-        env_all_nonzero &= value != 0.0;
-    }
-    let env_mean = env_sum / env.len() as f64;
+    let env_mean = sum_algebraic(&env) / env.len() as f32;
+    let env_all_nonzero = env.iter().all(|&value| value != 0.0);
 
     if env_all_nonzero {
         if let Some(high_boost_value) = spec.video_high_boost_value {
             let rf_top = spec
-                .video_rf_top_filter
+                .video_rf_top_fft_gain
                 .as_ref()
                 .context("high_boost_value requires rf_top")?;
-            let data_filtered = ifft_complex_real_owned_f32(
-                indata_fft.to_vec(),
-                spec.fft_block_inverse_f32.as_ref(),
-            );
-            // `high_part` is re-narrowed to f32 by `fft_real_f32` below, so store
-            // it as f32 (the sosfiltfilt recurrence still runs in f64) to halve
-            // this block-sized buffer.
-            let mut high_part = sosfiltfilt_f32(rf_top, &data_filtered);
+            // The zero-phase band extraction is a real spectrum gain, applied
+            // to the RF spectrum already in hand; only the per-sample envelope
+            // gain below needs the time domain.
+            let mut high_spectrum = indata_fft.clone();
+            multiply_spectrum_real(&mut high_spectrum, rf_top);
+            let mut high_part =
+                irfft_owned_f32(high_spectrum, None, spec.fft_block_c2r_f32.as_ref());
             assert_eq!(env.len(), high_part.len(), "env length mismatch");
+            // The per-sample gain numerator is constant across the block, so
+            // fold it into a single scale and only divide by the envelope level
+            // per sample.
+            let gain_numerator = env_mean * 0.9 * high_boost_value;
             for (sample, &level) in high_part.iter_mut().zip(&env) {
-                let gain = (env_mean * 0.9) / f64::from(level);
-                *sample *= (gain * high_boost_value) as f32;
+                *sample *= gain_numerator / level;
             }
-            let high_part_fft = fft_real_f32(&high_part, spec.fft_block_forward_f32.as_ref());
+            let high_part_fft = rfft_f32(&high_part, spec.fft_block_r2c_f32.as_ref());
             assert_eq!(
                 high_part_fft.len(),
                 indata_fft.len(),
                 "high_part_fft length mismatch"
             );
             for (sample, boost) in indata_fft.iter_mut().zip(high_part_fft) {
-                *sample = Complex32::new(
-                    (f64::from(sample.re) + f64::from(boost.re)) as f32,
-                    (f64::from(sample.im) + f64::from(boost.im)) as f32,
-                );
+                *sample += boost;
             }
             // The high boost rewrote indata_fft; recompute the analytic signal.
-            let hilbert_spectrum = spectrum_times_filter(&indata_fft, &spec.video_hilbert_filter);
+            let hilbert_spectrum = analytic_spectrum(&indata_fft, BLOCKSIZE);
             hilbert = ifft_complex_owned_f32(hilbert_spectrum, spec.fft_block_inverse_f32.as_ref());
         }
     } else {
@@ -395,27 +385,33 @@ pub(crate) fn decode_video_block(
     // The diff-demod spike check compares against an absolute-Hz threshold;
     // shift it into the recentered domain by the same `ire0`.
     let diff_demod_check_value = iretohz(ire0, f64::from(spec.sys_hz_ire), 100.0) * 2.0 - ire0;
-    if !spec.video_disable_diff_demod && max_excluding_edges(&demod, 20) > diff_demod_check_value {
+    if !spec.video_disable_diff_demod
+        && f64::from(max_excluding_edges(&demod, 20)) > diff_demod_check_value
+    {
         let hilbert_diffed = ediff1d_complex_to_begin_zero(&hilbert);
         let demod_b = unwrap_hilbert(&hilbert_diffed, spec.freq_hz(), spec.sys_ire0);
-        replace_spikes(&mut demod, &demod_b, diff_demod_check_value, 8, 30);
+        replace_spikes(&mut demod, &demod_b, diff_demod_check_value as f32, 8, 30);
     }
 
     // The video-EQ and chroma-trap stages are only active for a few formats.
-    // Both consume and produce the f32 demod directly (their filter recurrences
-    // and cubic resampling still evaluate in f64 per sample), so no widening copy
-    // of the block-sized demod is needed around them.
-    if let (Some(config), Some(state)) = (spec.video_eq_config.as_ref(), video_eq_state) {
-        demod = state.filter_video(config, &demod);
+    // The EQ (sharpness) adds back a zero-phase highpass of the demod, which is
+    // a real |H|^2 spectrum gain folded into one r2c/c2r round trip; the edge
+    // ringing this trades against the time-domain cascade lands in the
+    // BLOCKCUT margins, which are discarded.
+    if let Some(fft_gain) = spec.video_eq_fft_gain.as_ref() {
+        let mut spectrum =
+            rfft_owned_f32(std::mem::take(&mut demod), spec.fft_block_r2c_f32.as_ref());
+        multiply_spectrum_real(&mut spectrum, fft_gain);
+        demod = irfft_owned_f32(spectrum, None, spec.fft_block_c2r_f32.as_ref());
     }
 
     if let Some(chroma_trap) = &spec.video_chroma_trap {
         demod = chroma_trap.work(&demod);
     }
 
-    let demod_fft = rfft_f32(&demod, spec.fft_block_forward_f32.as_ref());
+    let demod_fft = rfft_f32(&demod, spec.fft_block_r2c_f32.as_ref());
     let out_video_fft = spectrum_times_filter(&demod_fft, &spec.video_filter);
-    let mut out_video = irfft_f32(&out_video_fft, None, spec.fft_block_inverse_f32.as_ref());
+    let mut out_video = irfft_f32(&out_video_fft, None, spec.fft_block_c2r_f32.as_ref());
 
     if spec.video_nldeemp_enabled {
         let highpass = spec
@@ -423,7 +419,7 @@ pub(crate) fn decode_video_block(
             .as_ref()
             .context("missing nonlinear high-pass filter")?;
         let hf_spectrum = spectrum_times_filter(&out_video_fft, highpass);
-        let hf_part = irfft_f32(&hf_spectrum, None, spec.fft_block_inverse_f32.as_ref());
+        let hf_part = irfft_owned_f32(hf_spectrum, None, spec.fft_block_c2r_f32.as_ref());
         // Clamp and subtract in a single pass so `hf_part` is read once instead
         // of being rewritten by a separate clamp pass and then read again.
         for (sample, hf) in out_video.iter_mut().zip(hf_part) {
@@ -438,12 +434,12 @@ pub(crate) fn decode_video_block(
         out_video = sub_deemphasis(spec, &out_video, &out_video_fft)?;
     }
 
-    if let Some((b, a)) = spec.video_fsc_notch.as_ref() {
-        out_video = filtfilt_f32(b, a, &out_video);
+    if let Some(sos) = spec.video_fsc_notch.as_ref() {
+        out_video = sosfiltfilt_f32(sos, &out_video);
     }
 
     let out_video05_fft = spectrum_times_filter(&demod_fft, &spec.video05_filter);
-    let mut out_video05 = irfft_f32(&out_video05_fft, None, spec.fft_block_inverse_f32.as_ref());
+    let mut out_video05 = irfft_owned_f32(out_video05_fft, None, spec.fft_block_c2r_f32.as_ref());
     roll(
         &mut out_video05,
         -(DecoderSpec::VIDEO05_FILTER_OFFSET as isize),
@@ -454,23 +450,18 @@ pub(crate) fn decode_video_block(
         out.demod_burst
             .extend_from_slice(slice_vec(rawdata, BLOCKCUT, BLOCKCUT_END, "chroma"));
     } else {
-        let out_chroma = if spec.color_system != ColorSystem::Monochrome {
-            demod_chroma_filt_array(
-                &rawdata[..BLOCKSIZE],
-                spec,
-                &spec.chroma_filter_video_burst,
-                BLOCKSIZE,
-                None,
-            )
+        // The burst chain (bandpass plus optional notches) is zero-phase, so it
+        // runs as the precomputed |H|^2 spectrum gain in one r2c/c2r round trip
+        // instead of cascaded time-domain forward/backward filters.
+        let source = if spec.color_system != ColorSystem::Monochrome {
+            &rawdata[..BLOCKSIZE]
         } else {
-            demod_chroma_filt_array(
-                &out_video,
-                spec,
-                &spec.chroma_filter_video_burst,
-                BLOCKSIZE,
-                None,
-            )
+            out_video.as_slice()
         };
+        let mut spectrum = rfft_f32(source, spec.fft_block_r2c_f32.as_ref());
+        multiply_spectrum_real(&mut spectrum, &spec.chroma_burst_block_fft_gain);
+        let filtered = irfft_owned_f32(spectrum, None, spec.fft_block_c2r_f32.as_ref());
+        let out_chroma = shift_chroma_and_remove_dc(filtered, spec.chroma_offset());
         out.demod_burst
             .extend_from_slice(slice_vec(&out_chroma, BLOCKCUT, BLOCKCUT_END, "chroma"));
     }
@@ -485,9 +476,9 @@ pub(crate) fn decode_video_block(
         out_video
     };
     // The three output channels share the identical `[BLOCKCUT .. len-BLOCKCUT_END]`
-    // index range. Append all three onto the shared field buffers in one fused
-    // loop so the reads and writes stay interleaved and each sample lands in its
-    // final place without a separate per-block buffer and concatenation copy.
+    // index range. Append each channel with a single bulk extend: the
+    // exact-length iterators reserve once and the loops vectorize, unlike a
+    // fused loop of per-sample pushes with their capacity checks.
     let demod_slice = slice_vec(&output_video, BLOCKCUT, BLOCKCUT_END, "demod");
     let demod_05_slice = slice_vec(&out_video05, BLOCKCUT, BLOCKCUT_END, "demod_05");
     let envelope_slice = slice_vec(&env, BLOCKCUT, BLOCKCUT_END, "envelope");
@@ -496,15 +487,10 @@ pub(crate) fn decode_video_block(
     // (levels, scaling, output) is unchanged. The envelope is amplitude data and
     // was never recentered.
     let ire0_f32 = spec.sys_ire0;
-    for ((&v, &v05), &env_sample) in demod_slice
-        .iter()
-        .zip(demod_05_slice.iter())
-        .zip(envelope_slice.iter())
-    {
-        out.demod.push(v + ire0_f32);
-        out.demod_05.push(v05 + ire0_f32);
-        out.envelope.push(env_sample);
-    }
+    out.demod.extend(demod_slice.iter().map(|&v| v + ire0_f32));
+    out.demod_05
+        .extend(demod_05_slice.iter().map(|&v| v + ire0_f32));
+    out.envelope.extend_from_slice(envelope_slice);
 
     Ok(())
 }

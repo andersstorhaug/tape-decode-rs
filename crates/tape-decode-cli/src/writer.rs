@@ -91,7 +91,7 @@ impl DecodeWriter {
 
             self.json_field_end = field_end;
         }
-        
+
         const LOG_INTERVAL: usize = 500;
 
         let field_num = self.field_count;
@@ -99,7 +99,12 @@ impl DecodeWriter {
         if field_num.is_multiple_of(LOG_INTERVAL) {
             let elapsed = now.duration_since(*start).as_secs_f64();
             let fps = fps(field_num, elapsed);
-            tracing::info!("Decoded {} fields so far in {:.3}s ({:.2} FPS)", field_num, elapsed, fps);
+            tracing::info!(
+                "Decoded {} fields so far in {:.3}s ({:.2} FPS)",
+                field_num,
+                elapsed,
+                fps
+            );
         }
 
         Ok(())
