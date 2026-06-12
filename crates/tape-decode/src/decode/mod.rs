@@ -38,22 +38,6 @@ fn hztoire(ire0: f64, hz_ire: f64, hz: f64) -> f64 {
     (hz - ire0) / hz_ire
 }
 
-fn pad_or_truncate<T: Copy>(data: &[T], filler: &[T]) -> Vec<T> {
-    if filler.len() > data.len() {
-        let err = filler.len() - data.len();
-        let start = resolve_slice_bound(filler.len(), data.len() as isize - err as isize);
-        let end = resolve_slice_bound(filler.len(), data.len() as isize);
-        let extra = filler.get(start..end).unwrap_or_default();
-
-        let mut output = Vec::with_capacity(data.len() + extra.len());
-        output.extend_from_slice(data);
-        output.extend_from_slice(extra);
-        output
-    } else {
-        data[data.len() - filler.len()..].to_vec()
-    }
-}
-
 fn inrange(a: f64, mi: f64, ma: f64) -> bool {
     a >= mi && a <= ma
 }
@@ -597,23 +581,6 @@ fn findpulses_raw(
     (starts, lengths)
 }
 
-fn chromasep_comb(data: &[f32], delay: usize) -> Vec<f32> {
-    if data.is_empty() {
-        return Vec::new();
-    }
-
-    let len = data.len();
-    let delay = delay % len;
-    // `(i + len - delay) % len` only wraps for the first `delay` outputs, so
-    // split the walk there: both halves pair contiguous slices, which drops the
-    // per-sample modulo and lets the loops vectorize.
-    let mut output = Vec::with_capacity(len);
-    let comb = |(&a, &b): (&f32, &f32)| (a + b) * 0.5;
-    output.extend(data[..delay].iter().zip(&data[len - delay..]).map(comb));
-    output.extend(data[delay..].iter().zip(&data[..len - delay]).map(comb));
-    output
-}
-
 pub const BLOCKSIZE: usize = 32 * 1024;
 pub(crate) const BLOCKCUT: usize = 1024;
 pub(crate) const BLOCKCUT_END: usize = 1024;
@@ -1001,10 +968,32 @@ fn demod_chroma_filt_array(
     shift_chroma_and_remove_dc(out_chroma, move_by.unwrap_or_else(|| spec.chroma_offset()))
 }
 
+/// One phase of the rational cubic resampler: the integer tap base for output
+/// `i` and the four Catmull-Rom weights, exactly as `cubic_resample` derived
+/// them (the fractional offset narrows to f32 before the weight polynomial).
+fn resample_phase_taps(input_rate: usize, output_rate: usize, i: usize) -> (isize, [f32; 4]) {
+    let scale = input_rate as f64 / output_rate as f64;
+    let pos = (i % output_rate) as f64 * scale;
+    let idx_off = pos.floor();
+    let f = (pos - idx_off) as f32;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let weights = [
+        -0.5 * f3 + f2 - 0.5 * f,
+        1.5 * f3 - 2.5 * f2 + 1.0,
+        -1.5 * f3 + 2.0 * f2 + 0.5 * f,
+        0.5 * f3 - 0.5 * f2,
+    ];
+    let base = (i / output_rate * input_rate) as isize + idx_off as isize;
+    (base, weights)
+}
+
 pub(crate) struct ChromaSepClass {
-    ratio_num: usize,
     ratio_den: usize,
-    delay: usize,
+    /// Offset of the first fused tap relative to the output index.
+    win_lo: isize,
+    /// Fused tap weights, one tap-offset row of `ratio_den` phase entries each.
+    fused_taps: Vec<Vec<f32>>,
 }
 
 impl ChromaSepClass {
@@ -1013,20 +1002,111 @@ impl ChromaSepClass {
         let delay = multiplier / 2;
         let fscx = (fsc * multiplier as f64 * 1e6) as usize;
         let (ratio_num, ratio_den) = limit_denominator(fscx as f64 / fs, 1000);
+
+        // The chain this implements — cubic upsample to multiplier*fsc, the
+        // half-cycle comb average, cubic downsample back — is linear and
+        // periodic with the output phase `i % ratio_den`, so it composes into
+        // one short FIR per phase over a contiguous input window. Probe each
+        // phase far enough into an imagined infinite stream that no composed
+        // index wraps, and accumulate the products of the stage weights per
+        // input tap; the offsets relative to the output index are
+        // phase-periodic by construction.
+        let probe_cycle = delay + 2;
+        let mut per_phase: Vec<std::collections::BTreeMap<isize, f64>> =
+            Vec::with_capacity(ratio_den);
+        for p in 0..ratio_den {
+            let i = p + probe_cycle * ratio_den;
+            let mut taps = std::collections::BTreeMap::new();
+            let (down_base, down_w) = resample_phase_taps(ratio_num, ratio_den, i);
+            for (k, &dw) in down_w.iter().enumerate() {
+                let j = down_base - 1 + k as isize;
+                for branch in [0, delay as isize] {
+                    let (up_base, up_w) =
+                        resample_phase_taps(ratio_den, ratio_num, (j - branch) as usize);
+                    for (m, &uw) in up_w.iter().enumerate() {
+                        let xi = up_base - 1 + m as isize - i as isize;
+                        *taps.entry(xi).or_insert(0.0) += f64::from(dw) * 0.5 * f64::from(uw);
+                    }
+                }
+            }
+            per_phase.push(taps);
+        }
+        let win_lo = per_phase
+            .iter()
+            .filter_map(|taps| taps.keys().next().copied())
+            .min()
+            .unwrap_or(0);
+        let win_hi = per_phase
+            .iter()
+            .filter_map(|taps| taps.keys().next_back().copied())
+            .max()
+            .unwrap_or(0);
+        let width = (win_hi - win_lo + 1) as usize;
+        let mut fused_taps = vec![vec![0.0f32; ratio_den]; width];
+        for (p, taps) in per_phase.iter().enumerate() {
+            for (&offset, &coeff) in taps {
+                fused_taps[(offset - win_lo) as usize][p] = coeff as f32;
+            }
+        }
         Self {
-            ratio_num,
             ratio_den,
-            delay,
+            win_lo,
+            fused_taps,
         }
     }
 
-    // It resamples the luminance data to self.multiplier * fsc
-    // Applies the comb filter, then resamples it back
+    // It resamples the luminance data to self.multiplier * fsc, applies the
+    // comb filter, then resamples it back — evaluated as the precomposed
+    // per-phase FIR. The few outputs whose window leaves the buffer (where
+    // the old chain clamped or wrapped) use clamped taps; they sit well
+    // inside the discarded block-cut margins.
     fn work(&self, luminance: &[f32]) -> Vec<f32> {
-        let downsampled = cubic_resample(luminance, self.ratio_den, self.ratio_num);
-        let combed = chromasep_comb(&downsampled, self.delay);
-        let result = cubic_resample(&combed, self.ratio_num, self.ratio_den);
-        pad_or_truncate(&result, luminance)
+        let len = luminance.len();
+        let den = self.ratio_den;
+        let width = self.fused_taps.len();
+        let win_lo = self.win_lo;
+
+        let edge_at = |i: usize| -> f32 {
+            let p = i % den;
+            let mut acc = 0.0f32;
+            for (u, taps) in self.fused_taps.iter().enumerate() {
+                acc += taps[p] * sample_clamped(luminance, i as isize + win_lo + u as isize);
+            }
+            acc
+        };
+
+        let head_end = ((-win_lo).max(0) as usize).min(len);
+        let tail_start = (len as isize - win_lo - width as isize + 1)
+            .clamp(head_end as isize, len as isize) as usize;
+
+        let mut out = Vec::with_capacity(len);
+        out.extend((0..head_end).map(edge_at));
+        // The interior walks whole phase cycles; every tap row pairs a
+        // contiguous weight run with a contiguous input window, so the
+        // accumulation passes vectorize with no per-sample indexing.
+        let mut i = head_end;
+        while i < tail_start {
+            let p = i % den;
+            let run = (tail_start - i).min(den - p);
+            let x0 = (i as isize + win_lo) as usize;
+            let start = out.len();
+            out.extend(
+                self.fused_taps[0][p..p + run]
+                    .iter()
+                    .zip(&luminance[x0..x0 + run])
+                    .map(|(&w, &x)| w * x),
+            );
+            let dst = &mut out[start..start + run];
+            for (u, taps) in self.fused_taps.iter().enumerate().skip(1) {
+                let xs = &luminance[x0 + u..x0 + u + run];
+                for ((acc, &w), &x) in dst.iter_mut().zip(&taps[p..p + run]).zip(xs) {
+                    *acc += w * x;
+                }
+            }
+            i += run;
+        }
+        out.extend((tail_start..len).map(edge_at));
+        out
     }
 }
 
@@ -1044,162 +1124,6 @@ fn limit_denominator(x: f64, max_den: usize) -> (usize, usize) {
         }
     }
     (best_num, best_den)
-}
-
-fn cubic_resample(data: &[f32], input_rate: usize, output_rate: usize) -> Vec<f32> {
-    if data.is_empty() || input_rate == output_rate {
-        return data.to_vec();
-    }
-    let out_len = ((data.len() as u128 * output_rate as u128) / input_rate as u128) as usize;
-    let scale = input_rate as f64 / output_rate as f64;
-
-    // Output `i = q*output_rate + p` samples position `i*scale = q*input_rate +
-    // p*scale`, so the integer tap base advances by `input_rate` every
-    // `output_rate` outputs and the fractional offset depends only on the phase
-    // `p`. The four Catmull-Rom tap weights are a function of that offset alone,
-    // so precompute one weight set (and integer tap offset) per phase and reduce
-    // the per-output work to a table lookup and four multiply-adds, instead of
-    // re-deriving the cubic (and an f64 floor) for every sample. The tables are
-    // laid out per tap so the interior kernel loads weights as contiguous runs.
-    let mut tap_offsets: Vec<usize> = Vec::with_capacity(output_rate);
-    let mut tap_weights: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::with_capacity(output_rate));
-    for p in 0..output_rate {
-        let pos = p as f64 * scale;
-        let idx_off = pos.floor();
-        let f = (pos - idx_off) as f32;
-        let f2 = f * f;
-        let f3 = f2 * f;
-        tap_offsets.push(idx_off as usize);
-        tap_weights[0].push(-0.5 * f3 + f2 - 0.5 * f);
-        tap_weights[1].push(1.5 * f3 - 2.5 * f2 + 1.0);
-        tap_weights[2].push(-1.5 * f3 + 2.0 * f2 + 0.5 * f);
-        tap_weights[3].push(0.5 * f3 - 0.5 * f2);
-    }
-
-    // Tap index of output `i`; nondecreasing in `i`, so the outputs whose
-    // 4-tap window leaves the input form a head and a tail around an interior
-    // that needs no clamping.
-    let idx_at = |i: usize| -> isize {
-        (i / output_rate * input_rate) as isize + tap_offsets[i % output_rate] as isize
-    };
-    let clamped_at = |i: usize| -> f32 {
-        let p = i % output_rate;
-        let idx = idx_at(i);
-        let p0 = sample_clamped(data, idx - 1);
-        let p1 = sample_clamped(data, idx);
-        let p2 = sample_clamped(data, idx + 1);
-        let p3 = sample_clamped(data, idx + 2);
-        tap_weights[0][p] * p0 + tap_weights[1][p] * p1 + tap_weights[2][p] * p2
-            + tap_weights[3][p] * p3
-    };
-    let head_end = (0..out_len).find(|&i| idx_at(i) >= 1).unwrap_or(out_len);
-    let in_window = |i: usize| idx_at(i) + 2 < data.len() as isize;
-    // Binary search for the first output past the in-bounds interior.
-    let tail_start = {
-        let (mut lo, mut hi) = (head_end, out_len);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if in_window(mid) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    };
-
-    let mut out = Vec::with_capacity(out_len);
-    out.extend((0..head_end).map(clamped_at));
-    // The interior walks whole phase cycles: a single slice index per output
-    // replaces the four per-tap clamps, and the inner loop carries no phase
-    // wrap check. The tap offsets are nondecreasing within a cycle, so each
-    // run's window extremes sit at its endpoints; checking them once licenses
-    // the unchecked gathers in the vector kernel.
-    let mut i = head_end;
-    let mut phase = head_end % output_rate;
-    let mut base = head_end / output_rate * input_rate;
-    while i < tail_start {
-        let run = (tail_start - i).min(output_rate - phase);
-        let phase_end = phase + run;
-        let lo = base + tap_offsets[phase];
-        let hi = base + tap_offsets[phase_end - 1];
-        assert!(
-            lo >= 1 && hi + 2 < data.len(),
-            "resample window outside the input"
-        );
-        let tail = {
-            #[cfg(nightly_portable_simd)]
-            {
-                resample_run_simd(data, &mut out, base, &tap_offsets[..phase_end], &tap_weights, phase)
-            }
-            #[cfg(not(nightly_portable_simd))]
-            {
-                phase
-            }
-        };
-        for p in tail..phase_end {
-            let s = base + tap_offsets[p];
-            let window = &data[s - 1..s + 3];
-            out.push(
-                tap_weights[0][p] * window[0]
-                    + tap_weights[1][p] * window[1]
-                    + tap_weights[2][p] * window[2]
-                    + tap_weights[3][p] * window[3],
-            );
-        }
-        i += run;
-        phase = phase_end;
-        if phase == output_rate {
-            phase = 0;
-            base += input_rate;
-        }
-    }
-    out.extend((tail_start..out_len).map(clamped_at));
-    out
-}
-
-/// Vector body of one resample phase run: evaluates phases `[start,
-/// tap_offsets.len())` in 8-wide chunks against the fixed tap base and returns
-/// the first phase left for the scalar tail. The caller has checked the run's
-/// whole window range against the input bounds.
-#[cfg(nightly_portable_simd)]
-fn resample_run_simd(
-    data: &[f32],
-    out: &mut Vec<f32>,
-    base: usize,
-    tap_offsets: &[usize],
-    tap_weights: &[Vec<f32>; 4],
-    start: usize,
-) -> usize {
-    use std::simd::prelude::*;
-
-    const LANES: usize = 8;
-    let end = tap_offsets.len();
-    let base_v = Simd::splat(base);
-    let yes = Mask::splat(true);
-    let zero = Simd::splat(0.0f32);
-    let one = Simd::splat(1usize);
-    let mut p = start;
-    while p + LANES <= end {
-        let s = base_v + Simd::<usize, LANES>::from_slice(&tap_offsets[p..]);
-        let w0 = Simd::<f32, LANES>::from_slice(&tap_weights[0][p..]);
-        let w1 = Simd::<f32, LANES>::from_slice(&tap_weights[1][p..]);
-        let w2 = Simd::<f32, LANES>::from_slice(&tap_weights[2][p..]);
-        let w3 = Simd::<f32, LANES>::from_slice(&tap_weights[3][p..]);
-        // SAFETY: the run's tap windows are in bounds per the caller's check.
-        let (p0, p1, p2, p3) = unsafe {
-            (
-                Simd::gather_select_unchecked(data, yes, s - one, zero),
-                Simd::gather_select_unchecked(data, yes, s, zero),
-                Simd::gather_select_unchecked(data, yes, s + one, zero),
-                Simd::gather_select_unchecked(data, yes, s + one + one, zero),
-            )
-        };
-        let acc = w0 * p0 + w1 * p1 + w2 * p2 + w3 * p3;
-        out.extend_from_slice(&acc.to_array());
-        p += LANES;
-    }
-    p
 }
 
 fn sample_clamped(data: &[f32], idx: isize) -> f32 {
