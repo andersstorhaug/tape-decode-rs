@@ -74,20 +74,35 @@ fn hz_to_output_array(spec: &DecoderSpec, input: &[f32], ire0: f64, out_scale: f
 
 fn y_comb(input: &[f32], line_len: usize, limit: f32) -> Vec<f32> {
     let len = input.len();
-    // Every element is rewritten below, so start from a zeroed buffer.
-    let mut output = vec![0.0f32; len];
     if len == 0 {
-        return output;
+        return Vec::new();
     }
 
+    // The two delayed taps wrap at i = len - shift and i = shift respectively,
+    // so cutting the walk at both points leaves segments where each tap is one
+    // contiguous slice: no per-sample modulo, and the loops vectorize.
     let shift = line_len % len;
-    for i in 0..len {
-        let current = input[i];
-        let diffb = current - input[(i + shift) % len];
-        let difff = current - input[(i + len - shift) % len];
-        let clipped = (diffb + difff).clamp(-limit, limit);
-        output[i] = current - clipped / 2.0;
-    }
+    let mut output = Vec::with_capacity(len);
+    let mut emit = |range: std::ops::Range<usize>| {
+        let back_start = (range.start + shift) % len;
+        let fwd_start = (range.start + len - shift) % len;
+        let current = &input[range.clone()];
+        let back = &input[back_start..back_start + current.len()];
+        let fwd = &input[fwd_start..fwd_start + current.len()];
+        output.extend(current.iter().zip(back).zip(fwd).map(
+            |((&current, &back), &fwd)| {
+                let diffb = current - back;
+                let difff = current - fwd;
+                let clipped = (diffb + difff).clamp(-limit, limit);
+                current - clipped / 2.0
+            },
+        ));
+    };
+    let cut0 = shift.min(len - shift);
+    let cut1 = shift.max(len - shift);
+    emit(0..cut0);
+    emit(cut0..cut1);
+    emit(cut1..len);
     output
 }
 
@@ -109,14 +124,24 @@ where
     T: Float,
 {
     if values.is_empty() {
-        0.0
-    } else {
-        values
-            .iter()
-            .map(|&value| value.to_f64().unwrap())
-            .sum::<f64>()
-            / values.len() as f64
+        return 0.0;
     }
+    // Lane accumulators so the conversion and sum vectorize instead of running
+    // as one serial carried add over field-sized inputs.
+    const LANES: usize = 8;
+    let mut acc = [0.0f64; LANES];
+    let mut chunks = values.chunks_exact(LANES);
+    for chunk in &mut chunks {
+        for (lane, &value) in acc.iter_mut().zip(chunk) {
+            *lane += value.to_f64().unwrap();
+        }
+    }
+    let tail: f64 = chunks
+        .remainder()
+        .iter()
+        .map(|&value| value.to_f64().unwrap())
+        .sum();
+    (acc.iter().sum::<f64>() + tail) / values.len() as f64
 }
 
 fn median_from_values<T: Float>(values: &mut [T]) -> T {

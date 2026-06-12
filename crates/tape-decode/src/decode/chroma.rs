@@ -80,9 +80,15 @@ fn upconvert_chroma(
             continue;
         }
 
-        let heterodyne_row = &chroma_heterodyne[current_phase];
-        for i in start..end {
-            uphet[i] = chroma[i] * heterodyne_row[i];
+        // Pair the line as slices so the loop carries no per-sample bounds
+        // checks and vectorizes.
+        let heterodyne_row = &chroma_heterodyne[current_phase][start..end];
+        for ((out, &sample), &het) in uphet[start..end]
+            .iter_mut()
+            .zip(&chroma[start..end])
+            .zip(heterodyne_row)
+        {
+            *out = sample * het;
         }
     }
 

@@ -14,24 +14,41 @@ fn find_dropouts_rf(
     // most recent dropout is ever extended, so the open one is always the last.
     let mut dropouts: Vec<(usize, isize)> = Vec::new();
 
-    for i in start_rf..end_rf {
-        let value = env[i];
-
-        if value <= down_thresh {
-            let should_start = match dropouts.last() {
-                None => true,
-                Some(&(_, end)) => end != -1 && (i as isize - end) > merge_threshold,
-            };
-            if should_start {
-                dropouts.push((i, -1));
-            }
-        } else if value >= up_thresh {
-            if let Some(last) = dropouts.last_mut() {
-                if last.1 == -1 {
-                    last.1 = i as isize;
+    // A closed state only reacts to value <= down_thresh and an open one only
+    // to value >= up_thresh, so a chunk without the relevant crossing (the
+    // overwhelmingly common case) is skipped on one vectorizable min/max scan.
+    const CHUNK: usize = 64;
+    let mut chunk_start = start_rf;
+    while chunk_start < end_rf {
+        let chunk_end = (chunk_start + CHUNK).min(end_rf);
+        let chunk = &env[chunk_start..chunk_end];
+        let open = matches!(dropouts.last(), Some(&(_, -1)));
+        let skip = if open {
+            chunk.iter().fold(f32::NEG_INFINITY, |acc, &v| acc.max(v)) < up_thresh
+        } else {
+            chunk.iter().fold(f32::INFINITY, |acc, &v| acc.min(v)) > down_thresh
+        };
+        if !skip {
+            for (offset, &value) in chunk.iter().enumerate() {
+                let i = chunk_start + offset;
+                if value <= down_thresh {
+                    let should_start = match dropouts.last() {
+                        None => true,
+                        Some(&(_, end)) => end != -1 && (i as isize - end) > merge_threshold,
+                    };
+                    if should_start {
+                        dropouts.push((i, -1));
+                    }
+                } else if value >= up_thresh {
+                    if let Some(last) = dropouts.last_mut() {
+                        if last.1 == -1 {
+                            last.1 = i as isize;
+                        }
+                    }
                 }
             }
         }
+        chunk_start = chunk_end;
     }
 
     if let Some(last) = dropouts.last_mut() {
