@@ -6,13 +6,15 @@ A decoder for analog tape formats, written in Rust. Ported from the [vhs-decode]
 
 ### From source
 
+Use nightly Rust for best performance builds.
+
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 ### Pre-built binaries
 
-Pre-built binaries for x64 Windows and Linux (glibc) are available in Releases. Ensure you use the correct one for your CPU feature level. On aarch64 it is recommended that you always build from source for the native architecture, as extension support is more varied.
+Pre-built binaries for x64 Windows and Linux (glibc) are available in Releases. Ensure you use the correct one for your [CPU feature level](https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels). On aarch64 it is recommended that you always build from source for the native architecture, as extension support is more varied.
 
 ## Usage
 
